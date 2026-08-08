@@ -33,7 +33,7 @@ impl AnnClient for PgvectorAnnClient {
                 ce.id,
                 d.source,
                 d.content,
-                1 - (ce.embedding <=> $1::vector) AS similarity
+                (1 - (ce.embedding <=> $1::vector))::float4 AS similarity
             FROM chunk_embeddings ce
             JOIN documents d ON d.id = ce.id
             ORDER BY ce.embedding <=> $1::vector
@@ -113,33 +113,42 @@ mod tests {
 
     #[tokio::test]
     async fn returns_ranked_hits_by_cosine_similarity() {
-        let token = unique_token("ann-rank");
-        let id_a = format!("ann-{token}-a");
-        let id_b = format!("ann-{token}-b");
+        // `unique_token` already embeds pid + counter, so it doubles as the
+        // cleanable id prefix (stale rows from other runs never match it).
+        let prefix = unique_token("ann");
+        let id_a = format!("{prefix}-a");
+        let id_b = format!("{prefix}-b");
         let Some(pool) = test_db().await else {
             return;
         };
 
         let va = vec(1, 1024);
         let vb = vec(2, 1024);
-        insert_document(&pool, &id_a, "wiki/api.md", &format!("alpha {token}"))
-            .await;
-        insert_document(&pool, &id_b, "wiki/errors.md", &format!("beta {token}"))
-            .await;
+        insert_document(&pool, &id_a, "wiki/api.md", &format!("alpha {prefix}")).await;
+        insert_document(&pool, &id_b, "wiki/errors.md", &format!("beta {prefix}")).await;
         insert_embedding(&pool, &id_a, &va).await;
         insert_embedding(&pool, &id_b, &vb).await;
 
-        // Query close to `va` (same seed), so `id_a` must rank first.
+        // Query close to `va` (same seed), so `id_a` must rank first. The
+        // shared table may hold unrelated rows from other runs, so ordering
+        // is asserted only among this test's own prefix-matched fixtures.
         let hits = PgvectorAnnClient::new(pool.clone())
             .search(&vec(1, 1024), 10)
             .await
             .unwrap();
 
-        let ids: Vec<&str> = hits.iter().filter(|h| h.id.starts_with("ann-")).map(|h| h.id.as_str()).collect();
+        let ids: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.id.starts_with(&prefix))
+            .map(|h| h.id.as_str())
+            .collect();
         assert_eq!(ids, vec![id_a.as_str(), id_b.as_str()], "closest fixture should rank first");
-        assert!(hits.iter().any(|h| h.id == id_a && h.similarity > 0.99), "near-identical vector should score near 1.0");
+        assert!(
+            hits.iter().any(|h| h.id == id_a && h.similarity > 0.99),
+            "near-identical vector should score near 1.0"
+        );
 
-        cleanup_documents(&pool, "ann-rank").await;
+        cleanup_documents(&pool, &prefix).await;
     }
 
     #[tokio::test]
@@ -158,15 +167,14 @@ mod tests {
 
     #[tokio::test]
     async fn limit_is_respected() {
-        let token = unique_token("ann-limit");
-        let id_prefix = format!("ann-{token}");
+        let prefix = unique_token("ann");
         let Some(pool) = test_db().await else {
             return;
         };
 
         for i in 0..3 {
-            let id = format!("{id_prefix}-{i}");
-            insert_document(&pool, &id, "wiki/test.md", &format!("doc {i} {token}")).await;
+            let id = format!("{prefix}-{i}");
+            insert_document(&pool, &id, "wiki/test.md", &format!("doc {i} {prefix}")).await;
             insert_embedding(&pool, &id, &vec(10 + i, 1024)).await;
         }
 
@@ -174,6 +182,6 @@ mod tests {
         let hits = PgvectorAnnClient::new(pool.clone()).search(&vec(99, 1024), 2).await.unwrap();
         assert_eq!(hits.len(), 2, "limit=2 should cap results");
 
-        cleanup_documents(&pool, "ann-limit").await;
+        cleanup_documents(&pool, &prefix).await;
     }
 }

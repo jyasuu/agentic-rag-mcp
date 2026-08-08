@@ -1,20 +1,23 @@
-//! Local BGE-M3 query-embedding via `ort` (ONNX Runtime) (SPEC.md user
-//! story 15): no external embedding API dependency, cost, or latency for the
-//! ANN stage.
+//! BGE-M3 query-embedding for the ANN stage (SPEC.md user story 15).
 //!
-//! The embedder loads an ONNX export of BGE-M3 (`input_ids` + `attention_mask`
-//! int64 inputs, `last_hidden_state` float32 output, hidden dim 1024) plus a
-//! HF `tokenizer.json`, then computes the dense query embedding with the
-//! model's documented pooling: mean-pool `last_hidden_state` over non-padding
-//! tokens and L2-normalize. Pooling/normalization are pure functions, kept
-//! unit-testable; the session run itself is the only ORT-coupled part.
-//!
-//! Model directory layout (`RAG_MCP_EMBEDDING_MODEL_DIR`):
-//!   - `model_int8.onnx` (or `model.onnx`) -- the ONNX graph
-//!   - `tokenizer.json` -- HF tokenizer config
+//! Two backends, chosen by config in `wiring.rs`:
+//!   - `BgeM3Embedder` -- local ONNX Runtime: loads an ONNX export of BGE-M3
+//!     (`input_ids` + `attention_mask` int64 inputs, `last_hidden_state`
+//!     float32 output, hidden dim 1024) plus a HF `tokenizer.json`, then
+//!     computes the dense query embedding with the model's documented pooling:
+//!     mean-pool `last_hidden_state` over non-padding tokens and L2-normalize.
+//!     No external embedding API dependency, cost, or latency. Model directory
+//!     layout (`RAG_MCP_EMBEDDING_MODEL_DIR`): `model_int8.onnx` (or
+//!     `model.onnx`) + `tokenizer.json`.
+//!   - `OllamaEmbedder` -- a remote Ollama `/api/embed` endpoint (e.g. a
+//!     `bge-m3` model served through a tunnel). Useful when a shared Ollama
+//!     box already holds the model, at the cost of per-call network latency.
+//!     Wired when `RAG_MCP_OLLAMA_URL` is set, taking priority over the local
+//!     ONNX path.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -22,6 +25,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Value;
 use rag_core::{Embedder, RagError, RagResult};
+use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 /// Query text is truncated to this many tokens before embedding; BGE-M3
@@ -47,9 +51,92 @@ impl Embedder for UnavailableEmbedder {
     async fn embed(&self, _text: &str) -> RagResult<Vec<f32>> {
         Err(RagError::Embedding(
             "no embedding model configured -- set RAG_MCP_EMBEDDING_MODEL_DIR to a directory \
-             containing the BGE-M3 ONNX graph and tokenizer.json"
+             containing the BGE-M3 ONNX graph and tokenizer.json, or RAG_MCP_OLLAMA_URL to a \
+             remote Ollama serving an embedding model (e.g. bge-m3)"
                 .into(),
         ))
+    }
+}
+
+/// Remote Ollama `Embedder`: POSTs the text to `{base_url}/api/embed` and
+/// returns the first returned vector. Keeps the runtime unblocked (reqwest is
+/// async, unlike the local ONNX session), so the shared session-mutex
+/// serialization the local embedder needs doesn't apply here.
+pub struct OllamaEmbedder {
+    http: reqwest::Client,
+    base_url: String,
+    model: String,
+}
+
+/// One parsed `/api/embed` response. `embeddings` is a list -- one vector per
+/// input string -- so callers take the entry matching their single input.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EmbedResponse {
+    pub(crate) embeddings: Vec<Vec<f32>>,
+}
+
+/// Pure, unit-testable parser for an Ollama `/api/embed` response body.
+pub(crate) fn parse_embed_response(body: &str) -> anyhow::Result<Vec<Vec<f32>>> {
+    let resp: EmbedResponse =
+        serde_json::from_str(body).context("failed to parse Ollama /api/embed response")?;
+    Ok(resp.embeddings)
+}
+
+impl OllamaEmbedder {
+    pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
+            // Generous: the first call after the model is pulled or evicted
+            // pays a cold-load cost on the Ollama host.
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("failed to build Ollama HTTP client")?;
+        Ok(Self {
+            http,
+            base_url: base_url.into(),
+            model: model.into(),
+        })
+    }
+}
+
+#[async_trait]
+impl Embedder for OllamaEmbedder {
+    async fn embed(&self, text: &str) -> RagResult<Vec<f32>> {
+        let url = format!("{}/api/embed", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "model": self.model, "input": text }))
+            .send()
+            .await
+            .map_err(|e| RagError::Embedding(format!("Ollama embed request failed: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RagError::Embedding(format!(
+                "Ollama embed returned {status}: {body}"
+            )));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| RagError::Embedding(format!("failed to read Ollama embed response: {e}")))?;
+        let embeddings = parse_embed_response(&body)
+            .map_err(|e| RagError::Embedding(format!("Ollama embed response invalid: {e}")))?;
+        let vector = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| RagError::Embedding("Ollama embed returned no embeddings".into()))?;
+        if vector.len() != EMBEDDING_DIM {
+            return Err(RagError::Embedding(format!(
+                "Ollama model {} returned a {}-dim embedding, expected {} -- \
+                 configure a model with embedding_length {} (e.g. bge-m3)",
+                self.model,
+                vector.len(),
+                EMBEDDING_DIM,
+                EMBEDDING_DIM
+            )));
+        }
+        Ok(vector)
     }
 }
 
@@ -231,6 +318,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_embed_response_extracts_one_vector_per_input() {
+        let body = r#"{"model":"bge-m3","embeddings":[[0.1,0.2],[0.3,0.4]],"total_duration":1}"#;
+        let parsed = parse_embed_response(body).expect("response should parse");
+        assert_eq!(parsed, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+    }
+
+    #[test]
     fn l2_normalize_produces_unit_vector() {
         let v = l2_normalize(vec![3.0, 4.0]);
         assert_eq!(v, vec![0.6, 0.8]);
@@ -308,5 +402,23 @@ mod tests {
             related > unrelated,
             "semantically related terms should be closer (related={related}, unrelated={unrelated})"
         );
+    }
+
+    // Remote-Ollama integration test: runs when `RAG_MCP_OLLAMA_URL` points
+    // at a reachable Ollama serving an embedding model. Skipped -- not failed
+    // -- when unset, mirroring the ONNX `RAG_MCP_EMBEDDING_MODEL_DIR` gating.
+    #[tokio::test]
+    async fn embeds_chinese_text_end_to_end_via_ollama() {
+        let Some(url) = std::env::var("RAG_MCP_OLLAMA_URL").ok() else {
+            eprintln!("skipping: RAG_MCP_OLLAMA_URL not set");
+            return;
+        };
+        let model = std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into());
+        let embedder = OllamaEmbedder::new(url, model).expect("client should build");
+
+        let v = embedder.embed("苹果汁的制作方法介绍").await.expect("embed should succeed");
+        assert_eq!(v.len(), EMBEDDING_DIM, "bge-m3 should produce {EMBEDDING_DIM}-dim vectors");
+        let norm: f32 = v.iter().map(|x| x * x).sum();
+        assert!((norm - 1.0).abs() < 1e-2, "output should be unit length, norm {norm}");
     }
 }

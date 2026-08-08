@@ -5,10 +5,18 @@
 //! real backends, wired together, actually answer searches?
 //!
 //! Env-gated like every backend test in this crate: they run only when
-//! `RAG_MCP_DATABASE_URL`, `RAG_MCP_ELASTICSEARCH_URL`, and
-//! `RAG_MCP_EMBEDDING_MODEL_DIR` are all set, and are skipped -- not failed --
-//! otherwise. A single funnel is built once per test binary (via
-//! `tokio::sync::OnceCell`) so the BGE-M3 session isn't loaded per test.
+//! `RAG_MCP_DATABASE_URL`, `RAG_MCP_ELASTICSEARCH_URL`, and an embedding
+//! backend (`RAG_MCP_OLLAMA_URL` or `RAG_MCP_EMBEDDING_MODEL_DIR`) are all
+//! set, and are skipped -- not failed -- otherwise.
+//!
+//! Each test builds its own funnel *on its own tokio runtime*. A shared
+//! `OnceCell` is deliberately NOT used: `#[tokio::test]` gives every test a
+//! fresh runtime, and sqlx pools / reqwest clients bind background tasks to
+//! the runtime that created them. A pool or HTTP client created on test A's
+//! runtime silently breaks when test A finishes and its runtime is dropped
+//! (connects time out with `PoolTimedOut`, reqwest dies with "dispatch task
+//! is gone") -- so per-test construction is the correct, if slightly more
+//! expensive, pattern here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,7 +24,7 @@ use std::time::Duration;
 use rag_core::{Embedder, RetrievalFunnel, SearchFilters, SearchMode};
 
 use crate::config::Config;
-use crate::embedder::BgeM3Embedder;
+use crate::embedder::{BgeM3Embedder, OllamaEmbedder};
 use crate::es::EsClient;
 use crate::es::IK_ANALYZER;
 use crate::state::AppState;
@@ -32,58 +40,79 @@ struct Integration {
     index: String,
 }
 
-static INTEGRATION: tokio::sync::OnceCell<Option<Arc<Integration>>> =
-    tokio::sync::OnceCell::const_new();
-
 async fn integration() -> Option<Arc<Integration>> {
-    INTEGRATION
-        .get_or_init(|| async {
-            let (pool, es_url, model_dir) = match (
-                test_pool().await,
-                std::env::var("RAG_MCP_ELASTICSEARCH_URL").ok(),
-                std::env::var_os("RAG_MCP_EMBEDDING_MODEL_DIR"),
-            ) {
-                (Some(pool), Some(es_url), Some(model_dir)) => (pool, es_url, model_dir),
-                _ => {
-                    eprintln!(
-                        "skipping integration tests: RAG_MCP_DATABASE_URL / \
-                         RAG_MCP_ELASTICSEARCH_URL / RAG_MCP_EMBEDDING_MODEL_DIR not all set"
-                    );
-                    return None;
-                }
-            };
+    let (pool, es_url, embed) = match (
+        test_pool().await,
+        std::env::var("RAG_MCP_ELASTICSEARCH_URL").ok(),
+        ollama_backend().or_else(model_dir_backend),
+    ) {
+        (Some(pool), Some(es_url), Some(embed)) => (pool, es_url, embed),
+        _ => {
+            eprintln!(
+                "skipping integration tests: RAG_MCP_DATABASE_URL / \
+                 RAG_MCP_ELASTICSEARCH_URL / (RAG_MCP_OLLAMA_URL or \
+                 RAG_MCP_EMBEDDING_MODEL_DIR) not all set"
+            );
+            return None;
+        }
+    };
 
-            apply_schema(&pool).await;
-            // Generous timeout: this suite runs against the same single-node
-            // cluster as the ES pre-filter tests, concurrently.
-            let es = EsClient::new(&es_url, Duration::from_secs(30))
-                .expect("RAG_MCP_ELASTICSEARCH_URL set but client failed to build");
-            let index = format!("rag-itg-{}", unique_token("idx"));
-            es.ensure_index(&index, IK_ANALYZER)
-                .await
-                .expect("integration test index should be created");
-
-            let config = Config {
-                bind_addr: "127.0.0.1:0".parse().expect("static addr"),
-                auth_token: "test".into(),
-                database_url: std::env::var("RAG_MCP_DATABASE_URL").unwrap(),
-                elasticsearch_url: es_url,
-                es_index: index.clone(),
-                embedding_model_dir: Some(model_dir.into()),
-                connect_timeout: Duration::from_secs(5),
-            };
-            let funnel = build_funnel(
-                &config,
-                AppState {
-                    pg_pool: pool.clone(),
-                    es: es.clone(),
-                },
-            )
-            .expect("funnel should build");
-            Some(Arc::new(Integration { funnel, pool, es, index }))
-        })
+    apply_schema(&pool).await;
+    // Generous timeout: this suite runs against the same single-node
+    // cluster as the ES pre-filter tests, concurrently.
+    let es = EsClient::new(&es_url, Duration::from_secs(30))
+        .expect("RAG_MCP_ELASTICSEARCH_URL set but client failed to build");
+    let index = format!("rag-itg-{}", unique_token("idx"));
+    es.ensure_index(&index, IK_ANALYZER)
         .await
-        .clone()
+        .expect("integration test index should be created");
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("static addr"),
+        auth_token: "test".into(),
+        database_url: std::env::var("RAG_MCP_DATABASE_URL").unwrap(),
+        elasticsearch_url: es_url,
+        es_index: index.clone(),
+        embedding_model_dir: embed.model_dir.clone(),
+        ollama_url: embed.ollama_url.clone(),
+        ollama_model: embed.ollama_model.clone(),
+        connect_timeout: Duration::from_secs(5),
+    };
+    let funnel = build_funnel(
+        &config,
+        AppState {
+            pg_pool: pool.clone(),
+            es: es.clone(),
+        },
+    )
+    .expect("funnel should build");
+    Some(Arc::new(Integration { funnel, pool, es, index }))
+}
+
+/// Which embedding backend the integration suite should use: the remote
+/// Ollama endpoint when `RAG_MCP_OLLAMA_URL` is set (preferred -- no local
+/// ONNX session to serialize on), else the local ONNX model dir.
+struct EmbedBackend {
+    ollama_url: Option<String>,
+    ollama_model: String,
+    model_dir: Option<std::path::PathBuf>,
+}
+
+fn ollama_backend() -> Option<EmbedBackend> {
+    let url = std::env::var("RAG_MCP_OLLAMA_URL").ok()?;
+    Some(EmbedBackend {
+        ollama_url: Some(url),
+        ollama_model: std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into()),
+        model_dir: None,
+    })
+}
+
+fn model_dir_backend() -> Option<EmbedBackend> {
+    Some(EmbedBackend {
+        ollama_url: None,
+        ollama_model: "bge-m3".into(),
+        model_dir: std::env::var_os("RAG_MCP_EMBEDDING_MODEL_DIR").map(Into::into),
+    })
 }
 
 /// ES is near-real-time: poll until `id` is searchable in the shared index.
@@ -169,10 +198,23 @@ async fn vector_search_returns_semantic_results_end_to_end() {
     let id_a = format!("itg-{token}-apple");
     let id_b = format!("itg-{token}-physics");
 
-    // Seed embeddings with a temporary model session (dropped before the
-    // shared funnel's query-side embedding runs, keeping memory flat).
-    let model_dir = std::env::var("RAG_MCP_EMBEDDING_MODEL_DIR").expect("set in integration()");
-    let seeder = BgeM3Embedder::load(std::path::Path::new(&model_dir)).expect("model loads");
+    // Seed embeddings with a temporary embedder (dropped before the shared
+    // funnel's query-side embedding runs, keeping memory flat). Prefer the
+    // remote Ollama backend when configured; fall back to the local ONNX
+    // session.
+    let seeder: Box<dyn Embedder> = match std::env::var("RAG_MCP_OLLAMA_URL").ok() {
+        Some(url) => Box::new(
+            OllamaEmbedder::new(
+                url,
+                std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into()),
+            )
+            .expect("ollama client should build"),
+        ),
+        None => {
+            let model_dir = std::env::var("RAG_MCP_EMBEDDING_MODEL_DIR").expect("set in integration()");
+            Box::new(BgeM3Embedder::load(std::path::Path::new(&model_dir)).expect("model loads"))
+        }
+    };
     let va = seeder.embed("苹果汁的制作方法介绍").await.expect("embed a");
     let vb = seeder.embed("量子力学的基本理论").await.expect("embed b");
 

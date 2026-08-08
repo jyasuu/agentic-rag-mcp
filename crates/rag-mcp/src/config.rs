@@ -20,6 +20,13 @@ pub struct Config {
     /// keyword-only deployments can run without it; `vector_search` /
     /// semantic hybrid queries then fail with a clear error at call time.
     pub embedding_model_dir: Option<PathBuf>,
+    /// Remote Ollama base URL (e.g. `https://…trycloudflare.com`). When set,
+    /// embeddings are served by Ollama's `/api/embed` instead of the local
+    /// ONNX session (takes priority over `embedding_model_dir`).
+    pub ollama_url: Option<String>,
+    /// Model name sent to Ollama's `/api/embed`. Must have
+    /// `embedding_length = 1024` to match the `vector(1024)` column.
+    pub ollama_model: String,
     pub connect_timeout: Duration,
 }
 
@@ -45,6 +52,9 @@ impl Config {
 
         let embedding_model_dir = std::env::var_os("RAG_MCP_EMBEDDING_MODEL_DIR").map(Into::into);
 
+        let ollama_url = std::env::var("RAG_MCP_OLLAMA_URL").ok();
+        let ollama_model = std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into());
+
         let connect_timeout_secs: u64 = std::env::var("RAG_MCP_CONNECT_TIMEOUT_SECS")
             .ok()
             .map(|s| s.parse())
@@ -59,6 +69,8 @@ impl Config {
             elasticsearch_url,
             es_index,
             embedding_model_dir,
+            ollama_url,
+            ollama_model,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
         })
     }
