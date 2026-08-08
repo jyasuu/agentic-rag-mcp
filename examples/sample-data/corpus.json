@@ -1,0 +1,44 @@
+[
+  {
+    "id": "ex-zh-conn",
+    "source": "wiki/errors.md",
+    "language": "zh",
+    "content": "系统发生连接失败错误码 10054，说明远端主机关闭了连接，需要重试并增加退避时间。"
+  },
+  {
+    "id": "ex-zh-apple",
+    "source": "wiki/recipes.md",
+    "language": "zh",
+    "content": "苹果汁的制作方法介绍：选择新鲜苹果，洗净后榨汁，加入少量柠檬汁防止氧化，冷藏后饮用口感最佳。"
+  },
+  {
+    "id": "ex-zh-quantum",
+    "source": "wiki/physics.md",
+    "language": "zh",
+    "content": "量子力学的基本理论介绍：波函数描述粒子的量子态，测量会使叠加态坍缩，海森堡不确定性原理限制了同时精确测量位置与动量的能力。"
+  },
+  {
+    "id": "ex-zh-pay",
+    "source": "wiki/payments.md",
+    "language": "zh",
+    "content": "支付接口调用失败时，请检查签名是否正确、商户号是否有效，交易号 20240808001 当前状态为待重试。"
+  },
+  {
+    "id": "ex-en-connect",
+    "source": "wiki/api.md",
+    "language": "en",
+    "content": "connect_pool(): raises CONN_REFUSED when the connection attempt fails; retry with exponential backoff up to five times."
+  },
+  {
+    "id": "ex-en-validate",
+    "source": "wiki/api.md",
+    "language": "en",
+    "content": "validate_payload() checks the request body against the JSON schema and returns a normalized token that downstream services consume."
+  },
+  {
+    "id": "ex-code-10054",
+    "source": "wiki/errors.md",
+    "language": "en",
+    "content": "ERROR_10054: connection reset by peer on an established socket; the remote host closed the connection unexpectedly."
+  }
+]

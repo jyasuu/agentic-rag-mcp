@@ -4,6 +4,22 @@ Thin HTTP MCP server exposing retrieval primitives over an existing
 Postgres/pgvector + Elasticsearch knowledge base. See `SPEC.md` for the full
 design rationale.
 
+## Examples
+
+`examples/` has everything needed to stand up and drive the full stack:
+`quickstart.md` for the 5-minute path, `reference.md` for the complete config /
+tool / funnel reference, and idempotent scripts to start Postgres +
+Elasticsearch, apply the schema, seed a bilingual corpus, run the server, and
+query it over streamable HTTP.
+
+```sh
+./examples/scripts/01-start-backends.sh   # Postgres(pgvector) + ES(ik)
+./examples/scripts/02-apply-schema.sh     # migrations
+./examples/scripts/03-seed.sh             # corpus + BGE-M3 embeddings
+./examples/scripts/04-run-server.sh       # the MCP server
+./examples/scripts/06-sample-queries.sh   # drive all four tools
+```
+
 ## Workspace layout
 
 - `crates/rag-core` — transport-independent retrieval funnel
