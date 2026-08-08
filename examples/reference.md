@@ -160,6 +160,44 @@ curl -sS http://127.0.0.1:8080/mcp \
 The tool result arrives inside the MCP result's `content[].text` as a JSON
 string (see response shapes below).
 
+## Using it from opencode
+
+Register the running server with opencode's CLI (writes to
+`~/.config/opencode/opencode.json(c)` or a project `opencode.json`):
+
+```sh
+opencode mcp add agentic-rag \
+  --url http://127.0.0.1:8080/mcp \
+  --header "Authorization=Bearer dev-secret"   # KEY=VALUE form, not KEY: VALUE
+
+opencode mcp list                              # → "● ✓ agentic-rag connected"
+```
+
+The equivalent config entry (what `opencode mcp add` writes) is:
+
+```json
+{
+  "mcp": {
+    "agentic-rag": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8080/mcp",
+      "headers": { "Authorization": "Bearer dev-secret" }
+    }
+  }
+}
+```
+
+- Tools are namespaced by server name: `agentic-rag_search`,
+  `agentic-rag_keyword_search`, `agentic-rag_vector_search`,
+  `agentic-rag_fetch_by_id`.
+- A running opencode TUI session loads config once at startup — restart it to
+  see a newly added server. Fresh sessions (`opencode run 'try some rag'`,
+  `opencode mcp list`) load the current config immediately.
+- To remove the server, delete the `mcp.agentic-rag` block from the config
+  file (there is no `opencode mcp remove`).
+- `scripts/08-opencode-mcp.sh` wraps the register/verify/demo flow and fails
+  with a clear hint if the server isn't running.
+
 ## Tools
 
 Exposed via `crates/rag-mcp/src/server.rs`. All arguments pass through

@@ -29,6 +29,7 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 | [`scripts/05-mcp-call.sh`](scripts/05-mcp-call.sh) | Speaks MCP streamable HTTP to the server (init session, then one tool call). |
 | [`scripts/06-sample-queries.sh`](scripts/06-sample-queries.sh) | Demos all four tools against the seeded corpus. |
 | [`scripts/07-teardown.sh`](scripts/07-teardown.sh) | Stops (and optionally removes) the example containers. |
+| [`scripts/08-opencode-mcp.sh`](scripts/08-opencode-mcp.sh) | Registers the server with opencode, verifies the connection, and can run a real search session. |
 
 ## Prerequisites
 
@@ -37,6 +38,8 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 - `curl` and `jq` for the seed script and the MCP client helper.
 - A Postgres client. `psql` on `PATH` is used if present; otherwise the scripts
   fall back to `docker exec <pg-container> psql`.
+- `opencode` (with a configured model) to try the MCP integration end-to-end
+  via `scripts/08-opencode-mcp.sh`.
 - An embedding backend so `vector_search` / semantic hybrid queries work:
   either a reachable Ollama serving `bge-m3` (`RAG_MCP_OLLAMA_URL`), or the
   local ONNX model directory (`RAG_MCP_EMBEDDING_MODEL_DIR`).

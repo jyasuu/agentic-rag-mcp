@@ -167,6 +167,41 @@ this (the bearer token rides in the request headers):
 }
 ```
 
+### From opencode
+
+Register the server with `opencode mcp add` (or just run the helper script):
+
+```sh
+opencode mcp add agentic-rag \
+  --url http://127.0.0.1:8080/mcp \
+  --header "Authorization=Bearer dev-secret"     # KEY=VALUE, not KEY: VALUE
+
+opencode mcp list                                  # should show "✓ agentic-rag connected"
+```
+
+Then verify it end-to-end from a fresh session:
+
+```sh
+opencode run 'try some rag'
+```
+
+The tools surface as `agentic-rag_search`, `agentic-rag_keyword_search`,
+`agentic-rag_vector_search`, and `agentic-rag_fetch_by_id`.
+
+> **Note:** an already-running opencode session loads config at startup and
+> won't see the new server until you restart it. `opencode run` and
+> `opencode mcp list` pick it up immediately. To remove the server later,
+> delete the `mcp.agentic-rag` block from
+> `~/.config/opencode/opencode.json(c)` (or your project `opencode.json`).
+
+`./examples/scripts/08-opencode-mcp.sh` automates all of this:
+
+```sh
+./examples/scripts/08-opencode-mcp.sh          # register + show status
+./examples/scripts/08-opencode-mcp.sh --list   # status only
+./examples/scripts/08-opencode-mcp.sh --demo   # register + run a real search session
+```
+
 ## 7. Tear down
 
 ```sh
