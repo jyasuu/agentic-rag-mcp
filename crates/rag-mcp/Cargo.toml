@@ -1,0 +1,24 @@
+[package]
+name = "rag-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# NOTE: rmcp requires Rust 1.88+. This sandbox's apt-installed toolchain is
+# 1.75, so this crate could not be compiled/tested here — build it locally
+# or in CI with a current stable toolchain (e.g. via rustup).
+[dependencies]
+rag-core = { path = "../rag-core" }
+rmcp = { version = "0.3", features = ["server", "transport-streamable-http-server", "transport-worker"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = "0.8"
+anyhow = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
