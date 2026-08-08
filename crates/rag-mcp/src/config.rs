@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,6 +14,12 @@ pub struct Config {
     pub auth_token: String,
     pub database_url: String,
     pub elasticsearch_url: String,
+    /// Elasticsearch index the CDC sync writes and the ES pre-filter reads.
+    pub es_index: String,
+    /// Directory holding the BGE-M3 ONNX graph + tokenizer.json. Optional:
+    /// keyword-only deployments can run without it; `vector_search` /
+    /// semantic hybrid queries then fail with a clear error at call time.
+    pub embedding_model_dir: Option<PathBuf>,
     pub connect_timeout: Duration,
 }
 
@@ -34,6 +41,10 @@ impl Config {
         let elasticsearch_url = std::env::var("RAG_MCP_ELASTICSEARCH_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:9200".into());
 
+        let es_index = std::env::var("RAG_MCP_ES_INDEX").unwrap_or_else(|_| "documents".into());
+
+        let embedding_model_dir = std::env::var_os("RAG_MCP_EMBEDDING_MODEL_DIR").map(Into::into);
+
         let connect_timeout_secs: u64 = std::env::var("RAG_MCP_CONNECT_TIMEOUT_SECS")
             .ok()
             .map(|s| s.parse())
@@ -46,6 +57,8 @@ impl Config {
             auth_token,
             database_url,
             elasticsearch_url,
+            es_index,
+            embedding_model_dir,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
         })
     }

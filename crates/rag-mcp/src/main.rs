@@ -1,26 +1,31 @@
 mod auth;
-mod backends;
+mod ann;
 mod config;
+mod embedder;
 mod es;
+mod es_prefilter;
+mod fallback;
+#[cfg(test)]
+mod integration;
 mod server;
 mod state;
+mod store;
+#[cfg(test)]
+mod testutil;
+mod trigram;
 mod tsvector;
-
-use std::sync::Arc;
+mod wiring;
 
 use axum::middleware;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpService, session::local::LocalSessionManager,
 };
 
-use rag_core::RetrievalFunnel;
-
 use crate::auth::{require_bearer_token, BearerToken};
-use crate::backends::{NotImplementedAnn, NotImplementedContentStore, NotImplementedEmbedder};
 use crate::config::Config;
 use crate::server::RagMcpServer;
 use crate::state::AppState;
-use crate::tsvector::TsvectorPreFilter;
+use crate::wiring::build_funnel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,16 +41,11 @@ async fn main() -> anyhow::Result<()> {
     // call.
     let app_state = AppState::connect(&config).await?;
 
-    // TODO: replace the remaining `NotImplemented*` backends with real
-    // pg_trgm/Elasticsearch (additional PreFilterStrategy entries),
-    // pgvector (AnnClient), and BGE-M3 (Embedder) implementations, built
-    // from `app_state` -- see backends.rs and tsvector.rs.
-    let funnel = Arc::new(RetrievalFunnel::new(
-        vec![Box::new(TsvectorPreFilter::new(app_state.pg_pool.clone()))],
-        Box::new(NotImplementedAnn),
-        Box::new(NotImplementedEmbedder),
-        Box::new(NotImplementedContentStore),
-    ));
+    // The real backends: tsvector + ES(ik)/pg_trgm-fallback pre-filters,
+    // pgvector ANN, BGE-M3 embedder, and the Postgres content store — see
+    // `wiring.rs` for the funnel construction (shared with integration
+    // tests).
+    let funnel = build_funnel(&config, app_state)?;
 
     let rag_server = RagMcpServer::new(funnel.clone());
     let mcp_service = StreamableHttpService::new(

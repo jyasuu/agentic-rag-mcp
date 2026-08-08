@@ -10,11 +10,12 @@ use crate::es::EsClient;
 /// startup, with health checks so a misconfigured Postgres/Elasticsearch
 /// URL fails the process immediately with a clear error instead of
 /// surfacing as an opaque error on the first tool call.
-// Fields are unused until the PreFilterStrategy/AnnClient/ContentStore
-// tickets wire real backend implementations through this connection state
-// (see main.rs) -- for now, connecting and health-checking is the entire
-// scope of this scaffold.
-#[allow(dead_code)]
+// Shared backend connections, held for the lifetime of the process and
+// cloned into anything that needs them (the `PreFilterStrategy` /
+// `AnnClient` / `ContentStore` implementations wired in `main.rs`).
+// Constructed once at startup, with health checks so a misconfigured
+// Postgres/Elasticsearch URL fails the process immediately with a clear
+// error instead of surfacing as an opaque error on the first tool call.
 #[derive(Clone)]
 pub struct AppState {
     pub pg_pool: sqlx::PgPool,

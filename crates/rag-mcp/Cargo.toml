@@ -22,3 +22,10 @@ schemars = "0.8"
 anyhow = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# BGE-M3 via ONNX Runtime. The crate defaults to `download-binaries` (static
+# pyke builds, requiring glibc >= 2.38). This sandbox is Debian 12 (glibc
+# 2.36), so we use `load-dynamic` instead: ONNX Runtime is dlopen'd at runtime
+# from `ORT_DYLIB_PATH` (we point it at the manylinux wheel's
+# libonnxruntime.so, which only needs glibc 2.27).
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["ndarray", "tracing", "load-dynamic"] }
+tokenizers = "0.23"

@@ -54,7 +54,15 @@ fn parse_mode(mode: Option<String>) -> SearchMode {
 }
 
 fn to_mcp_error(err: rag_core::RagError) -> McpError {
-    McpError::internal_error(err.to_string(), None)
+    match &err {
+        // Not-found is a data condition, not an internal failure -- mapping
+        // it to its own error class (rather than "internal error") lets the
+        // calling agent tell "bad id" apart from "backend broken".
+        rag_core::RagError::NotFound(id) => {
+            McpError::invalid_request(format!("document not found: {id}"), None)
+        }
+        _ => McpError::internal_error(err.to_string(), None),
+    }
 }
 
 fn to_json(value: impl serde::Serialize) -> Result<String, McpError> {
