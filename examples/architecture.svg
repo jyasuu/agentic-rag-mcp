@@ -61,9 +61,9 @@
   <line x1="240" y1="450" x2="240" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="580" y1="450" x2="580" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="920" y1="450" x2="920" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="248" y="486" font-size="10" fill="#475569">pre-filter + content store</text>
+  <text x="248" y="486" font-size="10" fill="#475569">pre-filter + content store + ANN</text>
   <text x="588" y="486" font-size="10" fill="#475569">keyword hits (ES)</text>
-  <text x="928" y="486" font-size="10" fill="#475569">query embedding</text>
+  <text x="928" y="486" font-size="10" fill="#475569">embed query (BGE-M3)</text>
 
   <!-- ② backends -->
   <text x="100" y="504" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1.5">② BACKENDS</text>
@@ -99,7 +99,7 @@
   <text x="776" y="626" font-size="11" font-weight="600" fill="#0f172a">BgeM3Embedder — local ONNX</text>
   <text x="776" y="643" font-size="11" fill="#334155">ort runtime (ORT_DYLIB_PATH) · mean-pool</text>
   <text x="776" y="660" font-size="11" fill="#334155">model_int8.onnx + tokenizer.json</text>
-  <text x="776" y="684" font-size="10" fill="#475569">chosen by RAG_MCP_OLLAMA_URL / MODEL_DIR</text>
+  <text x="776" y="684" font-size="10" fill="#475569">used at seed time (03-seed.sh) and query time (funnel)</text>
 
   <!-- ③ seeding & tooling -->
   <text x="100" y="736" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1.5">③ SEEDING &amp; TOOLING (examples/scripts)</text>
@@ -119,7 +119,7 @@
   <text x="396" y="805" text-anchor="middle" font-size="10" fill="#334155">extensions · tables · indexes</text>
   <text x="600" y="772" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0f172a">03-seed.sh</text>
   <text x="600" y="790" text-anchor="middle" font-size="10" fill="#334155">corpus.json → documents,</text>
-  <text x="600" y="805" text-anchor="middle" font-size="10" fill="#334155">embeddings + ES mirror</text>
+  <text x="600" y="805" text-anchor="middle" font-size="10" fill="#334155">embeds → chunk_embeddings + ES</text>
   <text x="804" y="772" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0f172a">04-run-server.sh</text>
   <text x="804" y="790" text-anchor="middle" font-size="10" fill="#334155">env defaults, then</text>
   <text x="804" y="805" text-anchor="middle" font-size="10" fill="#334155">cargo run -p rag-mcp</text>
@@ -130,7 +130,9 @@
   <!-- seeding arrows up into the backends -->
   <line x1="600" y1="752" x2="580" y2="700" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="396" y1="752" x2="240" y2="700" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="574" y="741" text-anchor="end" font-size="10" fill="#475569">writes schema → PG; corpus + embeddings + ES mirror</text>
+  <polyline points="660,752 660,720 920,720 920,700" fill="none" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
+  <text x="574" y="741" text-anchor="end" font-size="10" fill="#475569">schema → PG · corpus → PG + ES</text>
+  <text x="918" y="712" text-anchor="end" font-size="10" fill="#7c3aed">corpus → /api/embed → chunk_embeddings (vector(1024))</text>
 
   <text x="560" y="872" text-anchor="middle" font-size="11" fill="#64748b">Query path: ① clients → server → funnel → ② backends.  Seeding: ③ fills schema + data into ②.  Live walkthrough: examples/quickstart.md</text>
 </svg>
