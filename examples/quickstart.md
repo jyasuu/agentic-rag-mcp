@@ -16,7 +16,7 @@ same as the tests.
 - `curl`, `jq`
 - `psql` on `PATH`, *or* just the docker containers (scripts fall back to
   `docker exec`)
-- An embedding backend for the ANN stage (recommended: a remote Ollama serving
+- An embedding backend for semantic search (recommended: a remote Ollama serving
   `bge-m3`; alternatively the local ONNX model dir)
 
 ## 1. Start Postgres + Elasticsearch
@@ -59,10 +59,12 @@ Chinese keyword search will rely on fallback matching (no `ik` segmentation).
 Applies every `crates/rag-mcp/migrations/*.sql` idempotently:
 
 - `documents` table with a stored `search_vector` (tsvector over
-  `to_tsvector('simple', content)`) and a GIN index — the tsvector pre-filter.
-- `vector` and `pg_trgm` extensions, the `chunk_embeddings` table
-  (`embedding vector(1024)`) with its HNSW index, and a GIN trigram index on
-  `documents.content` — the ANN stage and the pg_trgm fallback.
+  `to_tsvector('simple', content)`) and a GIN index — the content store and
+  the tsvector keyword fallback.
+- The `vector` + `pg_trgm` extensions and `chunk_embeddings` table are legacy
+  from the old pgvector path: the retrieval engine is now Elasticsearch, so
+  the server never reads them. They stay in the schema so external ingestion
+  keeps working.
 
 > **Note:** `CREATE EXTENSION` requires a superuser or a role granted the
 > extension's roles. The docker container from step 1 is a superuser, so the
@@ -82,10 +84,13 @@ support articles, English API docs, and error codes) and:
 1. Inserts each document into Postgres (`source`, `language`, `content`).
    `search_vector` is generated automatically.
 2. Calls Ollama's `/api/embed` once, batched, to get 1024-dim BGE-M3 embeddings
-   for every document, and upserts them into `chunk_embeddings`.
-   (First call can take ~40s if the model is cold on the Ollama host.)
+   for every document. (First call can take ~40s if the model is cold on the
+   Ollama host.)
 3. Mirrors each document into the Elasticsearch `documents` index with the
-   `ik_max_word` analyzer mapping, so Chinese keyword search works.
+   `ik_max_word` analyzer mapping and the `embedding` `dense_vector(1024)`
+   field, storing each embedding in its document. Elasticsearch is the sole
+   retrieval engine (BM25 / kNN / hybrid RRF), so the vector lives there — not
+   in Postgres.
 
 Rerun it any time; inserts are `ON CONFLICT ... DO UPDATE`. `--delete` removes
 exactly the fixture rows:

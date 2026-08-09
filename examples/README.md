@@ -9,10 +9,13 @@ streamable HTTP.
 Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 `crates/rag-mcp`:
 
-- Postgres + pgvector holds the corpus and the ANN embeddings.
-- Elasticsearch (with the `analysis-ik` plugin) backs Chinese keyword search.
-- The server runs a layered funnel: keyword pre-filter -> conditional ANN ->
-  weighted scoring, exposed as four MCP tools.
+- Elasticsearch is the sole retrieval engine: BM25 keyword search (with the
+  `analysis-ik` plugin for Chinese), kNN semantic search on the `embedding`
+  `dense_vector` field, and hybrid BM25+kNN fused client-side with RRF.
+- Postgres holds the corpus (the content store behind `fetch_by_id`) and the
+  tsvector keyword fallback, used when ES errors or returns no hits.
+- The server runs a thin dispatch funnel: one retrieval backend, the BGE-M3
+  embedder, and the content store, exposed as four MCP tools.
 
 ## Layout
 
@@ -25,7 +28,7 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 | [`sample-data/corpus.json`](sample-data/corpus.json) | Small bilingual fixture corpus used by the seed script. |
 | [`scripts/01-start-backends.sh`](scripts/01-start-backends.sh) | Starts the Postgres(pgvector) + Elasticsearch(ik) docker containers. |
 | [`scripts/02-apply-schema.sh`](scripts/02-apply-schema.sh) | Applies `migrations/*.sql` idempotently. |
-| [`scripts/03-seed.sh`](scripts/03-seed.sh) | Loads the corpus into Postgres, computes + stores embeddings, mirrors docs into ES. |
+| [`scripts/03-seed.sh`](scripts/03-seed.sh) | Loads the corpus into Postgres, computes embeddings, mirrors docs + vectors into ES. |
 | [`scripts/04-run-server.sh`](scripts/04-run-server.sh) | Builds and runs the MCP server with the example defaults. |
 | [`scripts/05-mcp-call.sh`](scripts/05-mcp-call.sh) | Speaks MCP streamable HTTP to the server (init session, then one tool call). |
 | [`scripts/06-sample-queries.sh`](scripts/06-sample-queries.sh) | Demos all four tools against the seeded corpus. |
@@ -55,7 +58,7 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 ./examples/scripts/02-apply-schema.sh
 
 # 3. Corpus + embeddings. Requires RAG_MCP_OLLAMA_URL (recommended) or
-#    RAG_MCP_EMBEDDING_MODEL_DIR for the ANN stage.
+#    RAG_MCP_EMBEDDING_MODEL_DIR for semantic search.
 export RAG_MCP_OLLAMA_URL="${RAG_MCP_OLLAMA_URL:-http://127.0.0.1:11434}"
 ./examples/scripts/03-seed.sh
 
@@ -77,7 +80,7 @@ exactly the fixture rows it created.
   `RAG_MCP_ELASTICSEARCH_URL` at any ES 8.x node (Chinese word segmentation
   will degrade to fallback matching without the plugin).
 - The server requires Elasticsearch to be reachable **at startup** (it
-  health-checks both backends). The pg_trgm fallback only covers ES being
-  down *after* startup / unsynced during queries.
+  health-checks both backends). The tsvector keyword fallback only covers ES
+  being down *after* startup / unsynced during keyword queries.
 - `docs` live in `reference.md`; the scripts are thin wrappers around the
   documented contract, so read the reference before modifying them.

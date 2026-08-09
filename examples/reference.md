@@ -16,19 +16,22 @@ MCP client ──POST /mcp (Bearer auth)──> rag-mcp server
                                            │         vector_search, fetch_by_id
                                            ▼
                                   RetrievalFunnel (rag-core, transport-free)
-                                           │
-              ┌───────────────┬────────────┼──────────────┬───────────────┐
-              ▼               ▼            ▼              ▼               ▼
-        tsvector        ES(ik) ─┐     pgvector      Ollama / ONNX      Postgres
-        (English/code)   pg_trgm│     ANN stage      embedder          content store
-                           └fallback│
+                                           │  maps mode → one request shape
+                       ┌───────────────────┼──────────────────────┬──────────┐
+                       ▼                   ▼                      ▼          ▼
+              Elasticsearch          Ollama / ONNX        Postgres        Postgres
+              BM25 · kNN · RRF       embedder (BGE-M3)    content store   tsvector
+              (sole retrieval)       semantic/hybrid      fetch_by_id     keyword
+              hybrid fused           query vectors                        fallback
+              client-side RRF                                              (ES err/empty)
 ```
 
 The server (`crates/rag-mcp`) is a thin `rmcp` + `axum` layer. All retrieval
-logic lives in the transport-independent `RetrievalFunnel`
-(`crates/rag-core`). Backends behind the trait seams: tsvector pre-filter,
-Elasticsearch-with-ik primary + pg_trgm fallback, pgvector ANN, BGE-M3
-embeddings (remote Ollama or local ONNX), and a Postgres content store.
+logic lives in the transport-independent `RetrievalFunnel` (`crates/rag-core`).
+The funnel composes a single `RetrievalBackend` — Elasticsearch owns ranking
+(BM25 / kNN / RRF) — plus the BGE-M3 embedder (remote Ollama or local ONNX)
+and a Postgres content store. Postgres also hosts the tsvector keyword
+fallback, used only when Elasticsearch errors or returns no keyword hits.
 
 For the same picture as a diagram, see [`architecture.svg`](architecture.svg).
 
@@ -44,8 +47,10 @@ clear error.
 | `RAG_MCP_DATABASE_URL` | **yes** | — | Postgres URL, e.g. `postgres://rag:rag@127.0.0.1:5432/rag`. |
 | `RAG_MCP_BIND_ADDR` | no | `127.0.0.1:8080` | Socket the HTTP server binds. |
 | `RAG_MCP_ELASTICSEARCH_URL` | no | `http://127.0.0.1:9200` | ES cluster root. |
-| `RAG_MCP_ES_INDEX` | no | `documents` | Index the ES pre-filter reads (and the seed script writes). |
+| `RAG_MCP_ES_INDEX` | no | `documents` | Index the ES retrieval engine reads (and the seed script writes). |
 | `RAG_MCP_CONNECT_TIMEOUT_SECS` | no | `5` | Connect/health-check timeout for PG and ES, in seconds. |
+| `RAG_MCP_RRF_WINDOW_SIZE` | no | `100` | RRF `window_size`: how many hits per list each fused request contributes. |
+| `RAG_MCP_RRF_RANK_CONSTANT` | no | `60` | RRF `rank_constant` (the `k` in `1/(k + rank + 1)`). |
 | `RAG_MCP_OLLAMA_URL` | no | — | Remote Ollama base URL. **Takes priority over** `RAG_MCP_EMBEDDING_MODEL_DIR`. |
 | `RAG_MCP_OLLAMA_MODEL` | no | `bge-m3` | Model sent to Ollama `/api/embed`. Must output `embedding_length = 1024`. |
 | `RAG_MCP_EMBEDDING_MODEL_DIR` | no | — | Directory with the local BGE-M3 ONNX graph + `tokenizer.json`. |
@@ -110,12 +115,13 @@ CREATE INDEX chunk_embeddings_hnsw_idx
 CREATE INDEX documents_content_trgm_idx ON documents USING GIN (content gin_trgm_ops);
 ```
 
-- `vector(1024)` must match the embedder's output dims. Ollama models that
-  aren't `bge-m3` will fail the dim check at query time — the server errors on
-  a mismatched vector, it doesn't silently produce garbage.
+- **Legacy:** this is the retired pgvector path. The retrieval engine is now
+  Elasticsearch (vectors live in its `embedding` `dense_vector` field), so the
+  server never reads `chunk_embeddings` or the trigram index. The migration
+  stays in the schema so external ingestion processes that still write it keep
+  working; nothing in the query path touches it.
 - `CREATE EXTENSION` needs a superuser / extension role: run migrations as the
   schema-owner/ingestion role, not the runtime user.
-- Deleting a document cascades to its embedding (FK `ON DELETE CASCADE`).
 
 ## MCP endpoint and protocol
 
@@ -208,7 +214,8 @@ agent decides.
 
 ### `search`
 
-Full funnel: keyword pre-filter → conditional ANN → scoring.
+Mode dispatch → one request shape on the retrieval backend. `query`, `mode`,
+`source`, `language`, `limit`.
 
 | Param | Type | Required | Default | Meaning |
 | --- | --- | --- | --- | --- |
@@ -218,20 +225,22 @@ Full funnel: keyword pre-filter → conditional ANN → scoring.
 | `language` | string | no | — | Narrow to one language. |
 | `limit` | int | no | `10` | Max results. |
 
-Use `keyword` when the query is an exact term (error code, function name,
-precise phrase); `semantic` for vague, intent-based queries; `hybrid` (default)
-lets the funnel decide whether the keyword stage was confident enough to skip
-ANN.
+Mode mapping: `keyword` → a single BM25-only request; `semantic` → embed the
+query, then a kNN-only request; `hybrid` (default) → embed the query, then
+independent BM25 and kNN requests fused client-side with RRF. Use `keyword`
+for exact terms (error codes, function names); `semantic` for vague,
+intent-based queries; `hybrid` for the balanced default.
 
 ### `keyword_search`
 
-Pre-filter stage only (tsvector + ES-with-fallback). `query`, `limit`. Fast and
-precise for exact terms; never runs ANN.
+BM25-only (`keyword` mode). `query`, `limit`. Fast and precise for exact terms;
+never runs ANN and never embeds the query. Postgres tsvector stands in when ES
+errors or returns no hits.
 
 ### `vector_search`
 
-ANN stage only. `query`, `limit`. Requires a configured embedder. Best for
-vague, intent-based queries.
+kNN-only (`semantic` mode). `query`, `limit`. Requires a configured embedder.
+Best for vague, intent-based queries.
 
 ### `fetch_by_id`
 
@@ -255,9 +264,11 @@ Results (from `search` / `keyword_search` / `vector_search`) are arrays of:
 
 - `snippet` is an ES highlight fragment (`<em>…</em>` marks matched terms) when
   available; otherwise a fixed 200-char truncation of the content.
-- `matched_via` names the pre-filter strategies that produced the hit:
-  `elasticsearch` | `tsvector` | `trigram`.
-- `matched_ann` is `true` when the hit came from the ANN stage.
+- `matched_via` names the backend that produced the hit: `elasticsearch` |
+  `tsvector`.
+- `matched_ann` is `true` when the hit appeared in the kNN result list — i.e.
+  the request carried a kNN clause (semantic mode, or a hit found by the kNN
+  leg of a hybrid search).
 
 `fetch_by_id` returns:
 
@@ -275,48 +286,49 @@ Results (from `search` / `keyword_search` / `vector_search`) are arrays of:
 
 ## Funnel semantics (`crates/rag-core`)
 
-### Modes
+`RetrievalFunnel` composes a single `RetrievalBackend`, the embedder, and the
+content store. It maps the caller's mode onto exactly one request shape and
+passes the backend's scores through untouched — there is no cross-engine score
+merge, no calibration.
 
-- `keyword`: run pre-filter; **never** run ANN.
-- `semantic`: run ANN; skip pre-filter.
-- `hybrid`: run pre-filter, then run ANN **unless** the pre-filter stage is
-  "confident" (the short-circuit heuristic).
+### Modes → request shapes
 
-### Short-circuit (hybrid mode)
+- `keyword`: `keyword = Some(query), query_vector = None` → BM25-only request.
+- `semantic`: `keyword = None, query_vector = Some(embedding)` → kNN-only
+  request (exactly one embed call).
+- `hybrid`: `keyword = Some(query), query_vector = Some(embedding)` → two
+  independent requests (BM25-only and kNN-only) fused client-side with RRF.
 
-ANN is skipped when both:
+### Fusion (hybrid mode)
 
-- pre-filter hits `>= min_hit_count` (**3**), **and**
-- the top hit's raw score `>= min_top_score` (**0.5**).
+Reciprocal rank fusion, implemented in `es_prefilter.rs::rrf_fuse`:
 
-Config lives in `ShortCircuitConfig` (`scoring.rs`). Raw scores are
-strategy-native (ES BM25, etc.), so these are rough starting constants —
-flagged in SPEC.md as needing calibration against real traffic.
+- each hit contributes `1 / (rank_constant + rank + 1)` per list it appears in;
+- each list contributes at most `window_size` hits;
+- a hit present in the kNN list is an ANN match (`matched_ann: true`);
+- the keyword clause's `<em>` highlight wins; ANN-only hits fall back to a
+  truncated content snippet;
+- ties break by id (score desc, id asc) for deterministic ordering.
 
-### Scoring
-
-`score = 0.6 · exact + 0.35 · ann + 0.05 · metadata`
-
-Coefficients (`ScoringConfig`) are fixed; metadata is `0.0` for now. Inputs are
-normalized to `[0, 1]` before combining:
-
-- `exact`: the strategy raw score clamped to `[0, 1]` (ES BM25 scores above 1
-  saturate; listed as a known simplification, see `funnel.rs::normalize`).
-- `ann`: `1 - cosine_distance` (pgvector `<=>`), clamped to `[0, 1]`.
-- results are sorted by combined score desc, truncated to `limit`, deduped by
-  id (max signal per source stage wins).
+`RrfConfig { window_size, rank_constant }` defaults to ES's own RRF values
+(100 / 60) and is overridable via `RAG_MCP_RRF_WINDOW_SIZE` /
+`RAG_MCP_RRF_RANK_CONSTANT`. Fusing client-side is deliberate: ES's native
+`rank: { rrf }` API requires a paid license; rank-based fusion also needs no
+score-normalization coefficients.
 
 ## Backends
 
 ### tsvector (`tsvector.rs`)
 
 Exact/identifier matching over `documents.search_vector`
-(`to_tsvector('simple', ...)`) — `simple` config, no stemming. Primary path for
-English/code identifiers and error codes.
+(`to_tsvector('simple', ...)`) — `simple` config, no stemming. Serves as the
+**keyword fallback**: Elasticsearch is primary, and only when it errors or
+returns zero hits (an unavailable *or* unsynced cluster both produce that
+shape) does the tsvector keyword search run.
 
-### Elasticsearch + ik (`es_prefilter.rs`, `es.rs`)
+### Elasticsearch — the sole retrieval engine (`es_prefilter.rs`, `es.rs`)
 
-Primary Chinese path. The ES index mapping (as created by
+Owns all three request shapes. The index mapping (as created by
 `EsClient::ensure_index` and mirrored by the seed script):
 
 ```json
@@ -327,30 +339,32 @@ Primary Chinese path. The ES index mapping (as created by
   },
   "mappings": {
     "properties": {
-      "source":  { "type": "keyword" },
-      "content": { "type": "text", "analyzer": "ik_max_word" }
+      "source":    { "type": "keyword" },
+      "content":   { "type": "text", "analyzer": "ik_max_word" },
+      "embedding": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" }
     }
   }
 }
 ```
 
-Queries are `match` on `content` with the same `ik_max_word` analyzer, plus a
-one-fragment highlight (`<em>…</em>`, fragment_size 150). Elasticsearch is
-near-real-time: after indexing, a document may take ~1s to become searchable —
-the tests and the seed script poll for visibility.
+- **keyword** → `match` on `content` with the same `ik_max_word` analyzer,
+  plus a one-fragment highlight (`<em>…</em>`, fragment_size 150).
+- **semantic** → kNN on `embedding` (HNSW cosine). Exactly one embed call
+  plus this request.
+- **hybrid** → the two above, fused client-side with RRF (see Funnel
+  semantics).
+- Elasticsearch is near-real-time: after indexing, a document may take ~1s to
+  become searchable — the tests and the seed script poll for visibility.
+- Mapping changes (e.g. adding `embedding`) require deleting the index; the
+  seed script creates the index and notes this.
 
-### pg_trgm fallback (`fallback.rs`, `trigram.rs`)
+### Fallback (`fallback.rs`)
 
-`FallbackPreFilter` wraps ES as primary and pg_trgm as fallback. The fallback
-runs when the primary **errors or returns zero hits** — i.e. the "cluster
-down" *or* "not synced yet" cases. Trigram hits keep `matched_via:
-["trigram"]` provenance.
-
-### pgvector ANN (`ann.rs`)
-
-Cosine similarity: `similarity = 1 - (embedding <=> query)`, ordered by
-`<=>`, backed by the HNSW index. Query embeddings are bound as pgvector
-literals.
+`FallbackRetrievalBackend` wraps the ES primary and the tsvector keyword
+fallback. Only `keyword` mode can fall back (when the primary errors or returns
+no hits). `semantic` and `hybrid` never fall back: kNN cannot be served by
+tsvector, so the ES error surfaces as-is rather than silently degrading to
+keyword-only results. Fallback hits keep `matched_via: ["tsvector"]`.
 
 ### Embedders (`embedder.rs`)
 
@@ -382,7 +396,6 @@ Notable gotchas encoded in the tests:
   shared `OnceCell` pool breaks as soon as the first test's runtime drops
   (`PoolTimedOut`, "dispatch task is gone").
 - Fixture ids embed a unique per-process token so concurrent test runs never
-  collide in a shared database; pg_trgm fixtures additionally use a
-  prefix-free hex term so fuzzy matches don't bleed across tests.
+  collide in a shared database.
 - `apply_schema` runs under a Postgres advisory lock because `CREATE TABLE IF
   NOT EXISTS` is not race-free.

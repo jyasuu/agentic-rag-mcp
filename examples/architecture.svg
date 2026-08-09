@@ -8,7 +8,7 @@
 
   <!-- Title -->
   <text x="560" y="28" text-anchor="middle" font-size="22" font-weight="700" fill="#0f172a">agentic-rag-mcp — how it works</text>
-  <text x="560" y="46" text-anchor="middle" font-size="12" fill="#64748b">runtime query path, the backends it reaches, and the seeding/tooling scripts that fill them</text>
+  <text x="560" y="46" text-anchor="middle" font-size="12" fill="#64748b">runtime query path, the engines it reaches, and the seeding/tooling scripts that fill them</text>
 
   <!-- ① query path -->
   <text x="100" y="66" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1.5">① QUERY PATH (RUNTIME)</text>
@@ -52,44 +52,44 @@
   <!-- Funnel -->
   <rect x="80" y="318" width="960" height="132" rx="10" fill="#fffbeb" stroke="#d97706"/>
   <text x="560" y="341" text-anchor="middle" font-size="15" font-weight="700" fill="#78350f">RetrievalFunnel (rag-core — transport-independent)</text>
-  <text x="100" y="365" font-size="12" fill="#334155">1 &#160;keyword pre-filter — tsvector (English/code) · ES·ik primary · pg_trgm fallback</text>
-  <text x="100" y="385" font-size="12" fill="#334155">2 &#160;conditional ANN — pgvector cosine; skipped in hybrid mode when pre-filter is confident</text>
-  <text x="100" y="405" font-size="12" fill="#334155">3 &#160;scoring — 0.6·exact + 0.35·ann + 0.05·metadata → ranked snippets (matched_via / matched_ann)</text>
-  <text x="100" y="425" font-size="12" fill="#334155">4 &#160;content store — Postgres documents; fetch_by_id returns full content</text>
+  <text x="100" y="360" font-size="12" fill="#334155">1 &#160;mode mapping — keyword→BM25-only · semantic→embed + kNN-only · hybrid→embed + fused RRF</text>
+  <text x="100" y="380" font-size="12" fill="#334155">2 &#160;one RetrievalBackend — Elasticsearch owns ranking (BM25 / kNN / client-side RRF)</text>
+  <text x="100" y="400" font-size="12" fill="#334155">3 &#160;tsvector keyword fallback — Postgres, only when ES errors or returns no hits</text>
+  <text x="100" y="420" font-size="12" fill="#334155">4 &#160;engine score passes through — matched_via / matched_ann provenance</text>
+  <text x="100" y="440" font-size="12" fill="#334155">5 &#160;content store — Postgres documents; fetch_by_id returns full content</text>
 
   <!-- funnel → backends -->
   <line x1="240" y1="450" x2="240" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="580" y1="450" x2="580" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="920" y1="450" x2="920" y2="512" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
-  <text x="248" y="486" font-size="10" fill="#475569">pre-filter + content store + ANN</text>
-  <text x="588" y="486" font-size="10" fill="#475569">keyword hits (ES)</text>
+  <text x="248" y="486" font-size="10" fill="#475569">content store + tsvector fallback</text>
+  <text x="588" y="486" font-size="10" fill="#475569">retrieval: BM25 / kNN / RRF</text>
   <text x="928" y="486" font-size="10" fill="#475569">embed query (BGE-M3)</text>
 
   <!-- ② backends -->
-  <text x="100" y="504" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1.5">② BACKENDS</text>
+  <text x="100" y="504" font-size="12" font-weight="700" fill="#64748b" letter-spacing="1.5">② ENGINES</text>
 
   <!-- Postgres -->
   <rect x="80" y="512" width="320" height="188" rx="10" fill="#e0f2fe" stroke="#0284c7"/>
-  <text x="240" y="540" text-anchor="middle" font-size="14" font-weight="700" fill="#0c4a6e">Postgres + pgvector</text>
+  <text x="240" y="540" text-anchor="middle" font-size="14" font-weight="700" fill="#0c4a6e">Postgres + pgvector — content &amp; fallback</text>
   <text x="96" y="568" font-size="11" font-weight="600" fill="#0f172a">documents</text>
   <text x="96" y="585" font-size="11" fill="#334155">id · source · language · content · metadata</text>
   <text x="96" y="602" font-size="11" fill="#334155">search_vector — generated tsvector (simple) · GIN</text>
-  <text x="96" y="619" font-size="11" fill="#334155">content pg_trgm (GIN) — fallback pre-filter</text>
-  <text x="96" y="641" font-size="11" font-weight="600" fill="#0f172a">chunk_embeddings</text>
-  <text x="96" y="658" font-size="11" fill="#334155">vector(1024) · HNSW cosine · FK cascade</text>
-  <text x="96" y="684" font-size="10" fill="#475569">seeded by 03-seed.sh (upsert + cascade delete)</text>
+  <text x="96" y="619" font-size="11" fill="#334155">content store — fetch_by_id returns full body</text>
+  <text x="96" y="641" font-size="11" font-weight="600" fill="#0f172a">tsvector keyword fallback</text>
+  <text x="96" y="658" font-size="11" fill="#334155">used when ES errors or returns no hits</text>
+  <text x="96" y="684" font-size="10" fill="#475569">seeded by 02-apply-schema.sh + 03-seed.sh</text>
 
   <!-- Elasticsearch -->
   <rect x="420" y="512" width="320" height="188" rx="10" fill="#fdf2f8" stroke="#db2777"/>
-  <text x="580" y="540" text-anchor="middle" font-size="14" font-weight="700" fill="#831843">Elasticsearch</text>
+  <text x="580" y="540" text-anchor="middle" font-size="14" font-weight="700" fill="#831843">Elasticsearch — sole retrieval engine</text>
   <text x="436" y="568" font-size="11" font-weight="600" fill="#0f172a">documents index</text>
   <text x="436" y="585" font-size="11" fill="#334155">content: text · ik_max_word (Chinese)</text>
-  <text x="436" y="602" font-size="11" fill="#334155">source: keyword</text>
-  <text x="436" y="619" font-size="11" fill="#334155">match + highlight &lt;em&gt;…&lt;/em&gt; fragment</text>
-  <text x="436" y="641" font-size="11" fill="#334155">near-real-time — ~1s to be searchable</text>
-  <text x="436" y="658" font-size="11" fill="#334155">pg_trgm fallback covers ES-down / unsynced</text>
-  <text x="436" y="674" font-size="11" fill="#334155">keyword only — no vectors (ANN in pgvector)</text>
-  <text x="436" y="684" font-size="10" fill="#475569">seeded by 03-seed.sh (ES mirror)</text>
+  <text x="436" y="602" font-size="11" fill="#334155">embedding: dense_vector (1024-dim) · HNSW</text>
+  <text x="436" y="619" font-size="11" fill="#334155">request shapes: BM25-only · kNN-only · fused RRF</text>
+  <text x="436" y="641" font-size="11" font-weight="600" fill="#0f172a">highlights</text>
+  <text x="436" y="658" font-size="11" fill="#334155">&lt;em&gt;…&lt;/em&gt; fragment on keyword matches</text>
+  <text x="436" y="684" font-size="10" fill="#475569">seeded by 03-seed.sh (docs + embeddings)</text>
 
   <!-- Embedder -->
   <rect x="760" y="512" width="320" height="188" rx="10" fill="#faf5ff" stroke="#9333ea"/>
@@ -119,8 +119,8 @@
   <text x="396" y="790" text-anchor="middle" font-size="10" fill="#334155">applies migrations/*.sql</text>
   <text x="396" y="805" text-anchor="middle" font-size="10" fill="#334155">extensions · tables · indexes</text>
   <text x="600" y="772" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0f172a">03-seed.sh</text>
-  <text x="600" y="790" text-anchor="middle" font-size="10" fill="#334155">corpus.json → documents,</text>
-  <text x="600" y="805" text-anchor="middle" font-size="10" fill="#334155">embeds → chunk_embeddings + ES</text>
+  <text x="600" y="790" text-anchor="middle" font-size="10" fill="#334155">corpus.json → documents (PG),</text>
+  <text x="600" y="805" text-anchor="middle" font-size="10" fill="#334155">embeds → ES embedding field</text>
   <text x="804" y="772" text-anchor="middle" font-size="11.5" font-weight="700" fill="#0f172a">04-run-server.sh</text>
   <text x="804" y="790" text-anchor="middle" font-size="10" fill="#334155">env defaults, then</text>
   <text x="804" y="805" text-anchor="middle" font-size="10" fill="#334155">cargo run -p rag-mcp</text>
@@ -132,8 +132,8 @@
   <line x1="600" y1="752" x2="580" y2="700" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <line x1="396" y1="752" x2="240" y2="700" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
   <polyline points="660,752 660,720 920,720 920,700" fill="none" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="5,4" marker-end="url(#arrow)"/>
-  <text x="574" y="741" text-anchor="end" font-size="10" fill="#475569">schema → PG · corpus → PG + ES</text>
-  <text x="918" y="712" text-anchor="end" font-size="10" fill="#7c3aed">corpus → /api/embed → chunk_embeddings (vector(1024))</text>
+  <text x="574" y="741" text-anchor="end" font-size="10" fill="#475569">schema → PG · corpus → PG docs + ES docs/vectors</text>
+  <text x="918" y="712" text-anchor="end" font-size="10" fill="#7c3aed">corpus → /api/embed → ES embedding field (dense_vector · 1024)</text>
 
-  <text x="560" y="872" text-anchor="middle" font-size="11" fill="#64748b">Query path: ① clients → server → funnel → ② backends.  Seeding: ③ fills schema + data into ②.  Live walkthrough: examples/quickstart.md</text>
+  <text x="560" y="872" text-anchor="middle" font-size="11" fill="#64748b">Query path: ① clients → server → funnel → ② engines.  Seeding: ③ fills schema + data into ②.  Live walkthrough: examples/quickstart.md</text>
 </svg>

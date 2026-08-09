@@ -2,14 +2,17 @@
 # 03-seed.sh
 #
 # Loads the sample corpus into Postgres + Elasticsearch and (when an Ollama
-# endpoint is available) computes and stores BGE-M3 embeddings for the ANN
-# stage. Idempotent: documents and embeddings are upserted, ES index writes
-# replace by id. `--delete` removes exactly the fixture rows it manages.
+# endpoint is available) computes BGE-M3 embeddings and stores them in the ES
+# `embedding` dense_vector field — Elasticsearch is the sole retrieval engine
+# (BM25 / kNN / hybrid RRF), so the vector lives in the ES document, not in
+# Postgres. Idempotent: documents are upserted, ES index writes replace by id.
+# `--delete` removes exactly the fixture rows it manages.
 #
 # Embeddings: computed via RAG_MCP_OLLAMA_URL /api/embed (batch, one call).
 # A shell script cannot run the local ONNX embedder, so with only
 # RAG_MCP_EMBEDDING_MODEL_DIR set you must embed with your own tooling and
-# pass --no-embed (or use Ollama). Keyword search works without embeddings.
+# pass --no-embed (or use Ollama). Keyword search works without embeddings;
+# vector_search and semantic/hybrid modes need them (in ES).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,16 +68,21 @@ es_delete() {
 }
 
 es_index_doc() {
-  local id="$1" source="$2" content="$3"
+  local id="$1" source="$2" content="$3" embedding="$4"
   local body
-  body="$(jq -nc --arg s "$source" --arg c "$content" '{source:$s,content:$c}')"
+  if [[ -n "$embedding" && "$embedding" != "null" ]]; then
+    body="$(jq -nc --arg s "$source" --arg c "$content" --argjson e "$embedding" \
+      '{source:$s,content:$c,embedding:$e}')"
+  else
+    body="$(jq -nc --arg s "$source" --arg c "$content" '{source:$s,content:$c}')"
+  fi
   curl -fsS -m 10 -X PUT "$ES_URL/$ES_INDEX/_doc/$id" \
     -H 'Content-Type: application/json' -d "$body" >/dev/null
 }
 
 delete_seed() {
   wait_for_pg
-  echo "deleting ${N} fixture documents from Postgres (embeddings cascade)..."
+  echo "deleting ${N} fixture documents from Postgres..."
   psql_run -c "$(ids | while read -r id; do
     printf "DELETE FROM documents WHERE id = '%s';" "$(sql_escape "$id")"
   done)"
@@ -135,21 +143,13 @@ if [[ "$DO_EMBED" == 1 ]]; then
     fi
     dim="$(jq '.embeddings[0] | length' "$resp_file")"
     if [[ "$dim" != 1024 ]]; then
-      echo "error: model $model returned $dim-dim embeddings; expected 1024 (vector(1024) column)" >&2
+      echo "error: model $model returned $dim-dim embeddings; expected 1024 (ES dense_vector(1024) field)" >&2
       exit 1
     fi
 
-    echo "storing $N embeddings (${dim}-dim) into chunk_embeddings..."
-    sql_emb="$(mktemp)"
-    trap 'rm -f "$sql_file" "$resp_file" "$sql_emb"' EXIT
-    for i in $(seq 0 $((N - 1))); do
-      id="$(sql_escape "$(jq -r ".[$i].id" "$CORPUS")")"
-      vec="$(jq -c --argjson i "$i" '.embeddings[$i]' "$resp_file")"
-      printf "INSERT INTO chunk_embeddings (id, embedding) VALUES ('%s', '%s'::vector) ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding;\n" \
-        "$id" "$vec" >> "$sql_emb"
-    done
-    psql_run -f "$sql_emb"
-    rm -f "$sql_emb"
+    # The vectors ride along in the ES mirror step below (stored in each
+    # document's `embedding` field); keep the response file until then.
+    echo "computed $N embeddings (${dim}-dim) — will store them in the ES embedding field."
   fi
 fi
 
@@ -160,7 +160,7 @@ if [[ "$DO_ES" == 1 ]]; then
   if ! curl -fsS -m 5 "$ES_URL/_cluster/health" >/dev/null 2>&1; then
     echo "note: Elasticsearch unreachable at $ES_URL -- skipping ES mirror."
   else
-    echo "ensuring index $ES_INDEX (ik_max_word mapping)..."
+    echo "ensuring index $ES_INDEX (ik_max_word + embedding dense_vector(1024) mapping)..."
     curl -fsS -m 10 -X PUT "$ES_URL/$ES_INDEX" -H 'Content-Type: application/json' -d '{
       "settings": {
         "number_of_shards": 1,
@@ -169,15 +169,20 @@ if [[ "$DO_ES" == 1 ]]; then
       },
       "mappings": { "properties": {
         "source":  { "type": "keyword" },
-        "content": { "type": "text", "analyzer": "ik_max_word" }
+        "content": { "type": "text", "analyzer": "ik_max_word" },
+        "embedding": { "type": "dense_vector", "dims": 1024, "index": true, "similarity": "cosine" }
       } }
-    }' >/dev/null 2>&1 || echo "  (index may already exist -- continuing)"
+    }' >/dev/null 2>&1 || echo "  (index may already exist -- continuing; mapping changes require deleting the index)"
     echo "indexing $N documents into $ES_INDEX..."
     for i in $(seq 0 $((N - 1))); do
       id="$(jq -r ".[$i].id" "$CORPUS")"
       src="$(jq -r ".[$i].source" "$CORPUS")"
       content="$(jq -r ".[$i].content" "$CORPUS")"
-      es_index_doc "$id" "$src" "$content"
+      emb=""
+      if [[ -n "${resp_file:-}" && -f "$resp_file" ]]; then
+        emb="$(jq -c --argjson i "$i" '.embeddings[$i]' "$resp_file")"
+      fi
+      es_index_doc "$id" "$src" "$content" "$emb"
     done
     echo "ES is near-real-time: searches may need ~1s to see fresh docs."
   fi
