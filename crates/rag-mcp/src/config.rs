@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
+use rag_core::RrfConfig;
 
 /// Server configuration, sourced entirely from environment variables. Kept
 /// as a plain struct (rather than threading `std::env::var` calls through
@@ -28,6 +29,10 @@ pub struct Config {
     /// `embedding_length = 1024` to match the `vector(1024)` column.
     pub ollama_model: String,
     pub connect_timeout: Duration,
+    /// Reciprocal Rank Fusion parameters sent with every hybrid request
+    /// (`RAG_MCP_RRF_WINDOW_SIZE` / `RAG_MCP_RRF_RANK_CONSTANT`). Optional:
+    /// defaults match Elasticsearch's own RRF defaults.
+    pub rrf: RrfConfig,
 }
 
 impl Config {
@@ -62,6 +67,9 @@ impl Config {
             .context("RAG_MCP_CONNECT_TIMEOUT_SECS must be a valid integer")?
             .unwrap_or(5);
 
+        let rrf_window_size: usize = parse_usize_env("RAG_MCP_RRF_WINDOW_SIZE", 100)?;
+        let rrf_rank_constant: usize = parse_usize_env("RAG_MCP_RRF_RANK_CONSTANT", 60)?;
+
         Ok(Self {
             bind_addr,
             auth_token,
@@ -72,6 +80,23 @@ impl Config {
             ollama_url,
             ollama_model,
             connect_timeout: Duration::from_secs(connect_timeout_secs),
+            rrf: RrfConfig {
+                window_size: rrf_window_size,
+                rank_constant: rrf_rank_constant,
+            },
         })
     }
+}
+
+/// Reads an optional `usize` env var, returning `default` when unset and
+/// surfacing a clear parse error when set to a non-integer.
+fn parse_usize_env(name: &str, default: usize) -> anyhow::Result<usize> {
+    Ok(std::env::var(name)
+        .ok()
+        .map(|s| {
+            s.parse::<usize>()
+                .with_context(|| format!("{name} must be a valid positive integer"))
+        })
+        .transpose()?
+        .unwrap_or(default))
 }

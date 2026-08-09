@@ -4,34 +4,34 @@
 
 use std::sync::Arc;
 
-use rag_core::{Embedder, PreFilterStrategy, RetrievalFunnel};
+use rag_core::{Embedder, RetrievalBackend, RetrievalFunnel};
 
-use crate::ann::PgvectorAnnClient;
 use crate::config::Config;
 use crate::embedder::{BgeM3Embedder, OllamaEmbedder, UnavailableEmbedder};
-use crate::es_prefilter::EsPreFilter;
-use crate::fallback::FallbackPreFilter;
+use crate::es_prefilter::EsRetrievalBackend;
+use crate::fallback::FallbackRetrievalBackend;
 use crate::state::AppState;
 use crate::store::PostgresContentStore;
-use crate::trigram::TrigramPreFilter;
-use crate::tsvector::TsvectorPreFilter;
+use crate::tsvector::TsvectorRetrievalBackend;
 
-/// Builds the production funnel: tsvector pre-filter (English/code) plus the
-/// ES primary (Chinese/ik) with a pg_trgm fallback for an unavailable or
-/// unsynced cluster, pgvector ANN, an embedder, and the Postgres content
-/// store.
+/// Builds the production funnel: one Elasticsearch retrieval backend (BM25 /
+/// kNN / RRF) with the Postgres tsvector keyword fallback for an unavailable
+/// or unsynced cluster, the BGE-M3 embedder, and the Postgres content store.
 ///
 /// Embedder selection: `RAG_MCP_OLLAMA_URL` (remote Ollama) takes priority
 /// over the local ONNX `RAG_MCP_EMBEDDING_MODEL_DIR`; when neither is set, a
 /// clear-error stub is used so keyword-only deployments still start.
 pub fn build_funnel(config: &Config, app_state: AppState) -> anyhow::Result<Arc<RetrievalFunnel>> {
-    let prefilter: Vec<Box<dyn PreFilterStrategy>> = vec![
-        Box::new(TsvectorPreFilter::new(app_state.pg_pool.clone())),
-        Box::new(FallbackPreFilter::new(
-            Box::new(EsPreFilter::new(app_state.es.clone(), config.es_index.clone())),
-            Box::new(TrigramPreFilter::new(app_state.pg_pool.clone())),
-        )),
-    ];
+    let es_backend = EsRetrievalBackend::new(
+        app_state.es.clone(),
+        config.es_index.clone(),
+        config.rrf,
+    );
+
+    let backend: Box<dyn RetrievalBackend> = Box::new(FallbackRetrievalBackend::new(
+        Box::new(es_backend),
+        Box::new(TsvectorRetrievalBackend::new(app_state.pg_pool.clone())),
+    ));
 
     let embedder: Box<dyn Embedder> = match &config.ollama_url {
         Some(url) => {
@@ -54,8 +54,7 @@ pub fn build_funnel(config: &Config, app_state: AppState) -> anyhow::Result<Arc<
     };
 
     Ok(Arc::new(RetrievalFunnel::new(
-        prefilter,
-        Box::new(PgvectorAnnClient::new(app_state.pg_pool.clone())),
+        backend,
         embedder,
         Box::new(PostgresContentStore::new(app_state.pg_pool.clone())),
     )))

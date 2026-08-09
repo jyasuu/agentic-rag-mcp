@@ -1,13 +1,20 @@
 //! Minimal Elasticsearch client: a thin `reqwest` wrapper rather than a full
-//! ES SDK. All this crate needs from ES today is a reachability check at
-//! startup, the `ik_analyzer` pre-filter search (`EsPreFilter` in
-//! `es_prefilter.rs`), and the index mutations the CDC consumer applies
-//! (`cdc.rs`), all against the same `http`/`base_url`.
+//! ES SDK. Everything this crate needs from ES today is a reachability check
+//! at startup and the two search request shapes built by `EsRetrievalBackend`
+//! (see `es_prefilter.rs`):
+//!   - keyword  — BM25 `match` on the ik-analyzed `content`, query-only;
+//!   - semantic — kNN on the indexed `embedding` `dense_vector`, knn-only.
 //!
-//! The index schema is owned by the CDC sync (index created here with a text
-//! `content` field analyzed by `ik_max_word`), matching SPEC.md user story 11:
-//! Chinese queries get proper word segmentation rather than naive CJK
-//! tokenization.
+//! Hybrid mode issues both requests and fuses their ranks client-side with
+//! reciprocal rank fusion (`es_prefilter::rrf_fuse`). ES's native `rank: { rrf }`
+//! API is a paid-license feature, so the client-side fuse keeps hybrid
+//! retrieval working on the free (basic) license the `es-ik` image ships with.
+//!
+//! The index schema is owned by the seed script / CDC mirror (created here via
+//! `ensure_index`): a text `content` field analyzed by `ik_max_word`
+//! (SPEC.md user story 11: Chinese queries get proper word segmentation rather
+//! than naive CJK tokenization), a keyword `source` field, and an indexed
+//! `embedding` `dense_vector(1024)` cosine field for ANN/hybrid retrieval.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -16,20 +23,28 @@ use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::embedder::EMBEDDING_DIM;
+
 /// The `ik_max_word` analyzer/tokenizer name. The analysis-ik plugin
 /// registers it as both an analyzer and a tokenizer, so it can be used
 /// directly as the `content` field analyzer in mappings and in match-query
 /// search-time analysis.
 pub const IK_ANALYZER: &str = "ik_max_word";
 
+/// The indexed `dense_vector` field holding each document's BGE-M3 embedding.
+pub const EMBEDDING_FIELD: &str = "embedding";
+
 /// One parsed search hit. Kept ES-shape-agnostic (no `_`-prefixed fields) so
-/// the pre-filter strategy and any other caller consume a plain type.
+/// the retrieval backend and any other caller consume a plain type.
 #[derive(Debug, Clone, Deserialize)]
 pub struct EsSearchHit {
     pub id: String,
     pub score: Option<f32>,
     /// The `source` metadata field (document provenance, e.g. a wiki path).
     pub source: String,
+    /// Full content, used to build a truncated snippet when there is no
+    /// query-aware highlight (ANN-only hits).
+    pub content: Option<String>,
     /// Query-aware highlight fragments, in ES highlight format
     /// (`<em>…</em>`), used to build snippets per SPEC.md user story 7.
     pub highlight: Vec<String>,
@@ -59,9 +74,11 @@ struct RawSearchHit {
 #[derive(Debug, Deserialize)]
 struct Source {
     source: Option<String>,
+    content: Option<String>,
 }
 
-/// Pure, unit-testable parser for a `_search` response body.
+/// Pure, unit-testable parser for a `_search` response body. Handles all three
+/// request shapes — RRF scores arrive in the same `_score` field as BM25/kNN.
 pub(crate) fn parse_search_response(body: &str) -> anyhow::Result<Vec<EsSearchHit>> {
     let resp: SearchResponse = serde_json::from_str(body)
         .with_context(|| "failed to parse Elasticsearch _search response")?;
@@ -73,11 +90,60 @@ pub(crate) fn parse_search_response(body: &str) -> anyhow::Result<Vec<EsSearchHi
             id: h.id,
             score: h.score,
             source: h.source.source.unwrap_or_default(),
+            content: h.source.content,
             highlight: h.highlight.map_or_else(Vec::new, |f| {
                 f.into_iter().flat_map(|(_, frags)| frags).collect()
             }),
         })
         .collect())
+}
+
+/// `k` and `num_candidates` for the kNN clause. ES requires
+/// `num_candidates >= k`; both are derived from `limit` and kept small (the
+/// demo corpus is tiny, so a 10x candidate pool is plenty).
+fn knn_params(limit: usize) -> (usize, usize) {
+    let k = limit.max(1);
+    let num_candidates = k.saturating_mul(10).max(10);
+    (k, num_candidates)
+}
+
+fn highlight_block() -> serde_json::Value {
+    json!({
+        "fields": { "content": {
+            "pre_tags": ["<em>"],
+            "post_tags": ["</em>"],
+            "fragment_size": 150
+        } },
+        "number_of_fragments": 1
+    })
+}
+
+/// Pure request builder: BM25-only keyword search.
+pub(crate) fn build_keyword_request(
+    query: &str,
+    limit: usize,
+    analyzer: &str,
+) -> serde_json::Value {
+    json!({
+        "size": limit,
+        "query": { "match": { "content": { "query": query, "analyzer": analyzer } } },
+        "highlight": highlight_block(),
+    })
+}
+
+/// Pure request builder: kNN-only semantic search. No `query`, no `rank` — a
+/// single embed call plus this request is the whole semantic path.
+pub(crate) fn build_semantic_request(query_vector: &[f32], limit: usize) -> serde_json::Value {
+    let (k, num_candidates) = knn_params(limit);
+    json!({
+        "size": limit,
+        "knn": {
+            "field": EMBEDDING_FIELD,
+            "query_vector": query_vector,
+            "k": k,
+            "num_candidates": num_candidates
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -124,11 +190,11 @@ impl EsClient {
         &self.base_url
     }
 
-    /// `_search` against `index`, matching `content` with `analyzer` (the
-    /// caller's choice of ik segmentation granularity). Returns hits with
-    /// their query-aware highlights so the strategy can surface matched
-    /// terms in context.
-    pub async fn search(
+    /// `_search` against `index`: BM25 `match` on `content` with `analyzer`
+    /// (the caller's choice of ik segmentation granularity). Returns hits with
+    /// their query-aware highlights so the backend can surface matched terms
+    /// in context.
+    pub async fn search_keyword(
         &self,
         index: &str,
         query: &str,
@@ -136,22 +202,28 @@ impl EsClient {
         analyzer: &str,
     ) -> anyhow::Result<Vec<EsSearchHit>> {
         let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
-        let body = json!({
-            "size": limit,
-            "query": { "match": { "content": { "query": query, "analyzer": analyzer } } },
-            "highlight": {
-                "fields": { "content": {
-                    "pre_tags": ["<em>"],
-                    "post_tags": ["</em>"],
-                    "fragment_size": 150
-                } },
-                "number_of_fragments": 1
-            }
-        });
+        self.post_search(&url, &build_keyword_request(query, limit, analyzer))
+            .await
+    }
+
+    /// `_search` against `index`: kNN-only on `embedding`. The semantic path
+    /// is exactly one embed call plus this request.
+    pub async fn search_semantic(
+        &self,
+        index: &str,
+        query_vector: &[f32],
+        limit: usize,
+    ) -> anyhow::Result<Vec<EsSearchHit>> {
+        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
+        self.post_search(&url, &build_semantic_request(query_vector, limit))
+            .await
+    }
+
+    async fn post_search(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<Vec<EsSearchHit>> {
         let resp = self
             .http
-            .post(&url)
-            .json(&body)
+            .post(url)
+            .json(body)
             .send()
             .await
             .with_context(|| format!("failed to reach Elasticsearch at {url}"))?;
@@ -165,10 +237,14 @@ impl EsClient {
     }
 
     /// Idempotently creates `index` with a text `content` field analyzed by
-    /// `analyzer` (default `ik_max_word`) and a keyword `source` field, plus
-    /// the custom analyzer definition backing `ik_max_word`. Returns `Ok`
-    /// whether the index was created or already existed -- ES signals the
-    /// latter with a `resource_already_exists_exception` on the create call.
+    /// `analyzer` (default `ik_max_word`), a keyword `source` field, and an
+    /// indexed `embedding` `dense_vector(1024)` cosine field, plus the custom
+    /// analyzer definition backing `ik_max_word`. Returns `Ok` whether the
+    /// index was created or already existed -- ES signals the latter with a
+    /// `resource_already_exists_exception` on the create call.
+    ///
+    /// Mapping changes require index recreation; the example lifecycle is
+    /// create-or-bump (delete + recreate) driven by the seed script.
     #[allow(dead_code)]
     pub async fn ensure_index(&self, index: &str, analyzer: &str) -> anyhow::Result<()> {
         let url = format!("{}/{}", self.base_url.trim_end_matches('/'), index);
@@ -184,7 +260,13 @@ impl EsClient {
             },
             "mappings": { "properties": {
                 "source": { "type": "keyword" },
-                "content": { "type": "text", "analyzer": analyzer }
+                "content": { "type": "text", "analyzer": analyzer },
+                EMBEDDING_FIELD: {
+                    "type": "dense_vector",
+                    "dims": EMBEDDING_DIM,
+                    "index": true,
+                    "similarity": "cosine"
+                }
             } }
         });
         let resp = self
@@ -213,7 +295,8 @@ impl EsClient {
         }
     }
 
-    /// Indexes (inserts or replaces) one document.
+    /// Indexes (inserts or replaces) one document, optionally carrying its
+    /// BGE-M3 embedding so the index is self-sufficient for kNN/hybrid search.
     #[allow(dead_code)]
     pub async fn index_document(
         &self,
@@ -221,6 +304,7 @@ impl EsClient {
         id: &str,
         source: &str,
         content: &str,
+        embedding: Option<&[f32]>,
     ) -> anyhow::Result<()> {
         let url = format!(
             "{}/{}/_doc/{}",
@@ -228,7 +312,10 @@ impl EsClient {
             index,
             id
         );
-        let body = json!({ "source": source, "content": content });
+        let mut body = json!({ "source": source, "content": content });
+        if let Some(embedding) = embedding {
+            body[EMBEDDING_FIELD] = json!(embedding);
+        }
         let resp = self
             .http
             .put(&url)
@@ -285,7 +372,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_search_response_extracts_hits_and_highlights() {
+    fn parse_search_response_extracts_hits_highlights_and_content() {
         let body = r#"{
             "took": 3,
             "timed_out": false,
@@ -315,6 +402,7 @@ mod tests {
         assert_eq!(hits[0].id, "doc-1");
         assert_eq!(hits[0].score, Some(1.2));
         assert_eq!(hits[0].source, "wiki/zh.md");
+        assert_eq!(hits[0].content.as_deref(), Some("系统发生连接失败错误码"));
         assert_eq!(
             hits[0].highlight,
             vec!["系统发生<em>连接</em><em>失败</em>错误码"]
@@ -322,6 +410,7 @@ mod tests {
         // No highlight block -> empty fragments, not an error.
         assert!(hits[1].highlight.is_empty());
         assert_eq!(hits[1].score, Some(0.5));
+        assert_eq!(hits[1].content, None);
     }
 
     #[test]
@@ -350,5 +439,41 @@ mod tests {
     fn parse_search_response_errors_on_malformed_body() {
         assert!(parse_search_response("not json").is_err());
         assert!(parse_search_response(r#"{"hits": {"hits": []}}"#).is_ok());
+    }
+
+    #[test]
+    fn keyword_request_is_query_only_with_ik_analyzer_and_highlight() {
+        let req = build_keyword_request("连接失败", 5, IK_ANALYZER);
+        assert_eq!(req["size"], 5);
+        assert_eq!(
+            req["query"]["match"]["content"]["query"],
+            "连接失败",
+            "keyword request must match content via BM25"
+        );
+        assert_eq!(req["query"]["match"]["content"]["analyzer"], IK_ANALYZER);
+        assert!(req.get("knn").is_none(), "keyword request must not carry a kNN clause");
+        assert!(req.get("rank").is_none(), "keyword request must not carry RRF");
+        assert!(req["highlight"]["fields"]["content"]["pre_tags"][0] == "<em>");
+    }
+
+    #[test]
+    fn semantic_request_is_knn_only() {
+        let vector: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let req = build_semantic_request(&vector, 3);
+        assert_eq!(req["size"], 3);
+        assert!(req.get("query").is_none(), "semantic request must not carry a BM25 clause");
+        assert!(req.get("rank").is_none(), "semantic request must not carry RRF");
+        assert_eq!(req["knn"]["field"], EMBEDDING_FIELD);
+        assert_eq!(req["knn"]["query_vector"], serde_json::json!([0.0, 1.0, 2.0, 3.0]));
+        assert_eq!(req["knn"]["k"], 3);
+        assert_eq!(req["knn"]["num_candidates"], 30, "num_candidates must be derived from limit and >= k");
+    }
+
+    #[test]
+    fn semantic_request_keeps_num_candidates_at_least_k_for_small_limits() {
+        let req = build_semantic_request(&[0.1, 0.2], 1);
+        let k = req["knn"]["k"].as_u64().unwrap();
+        let num_candidates = req["knn"]["num_candidates"].as_u64().unwrap();
+        assert!(num_candidates >= k, "num_candidates {num_candidates} must be >= k {k}");
     }
 }

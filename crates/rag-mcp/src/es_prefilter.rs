@@ -1,58 +1,206 @@
-//! Elasticsearch + `ik_analyzer` `PreFilterStrategy` (SPEC.md user story 11):
-//! Chinese-language keyword search with proper word segmentation, returning
-//! ES-highlight-based snippets so matched terms are visible in context
-//! (user story 7). This is the primary pre-filter for the corpus's majority
-//! Chinese content; the funnel runs it alongside the Postgres `tsvector`
-//! strategy (English/code identifiers) and merges hits.
+//! Elasticsearch `RetrievalBackend` — the single retrieval engine behind the
+//! funnel. Keyword mode issues a BM25-only request, semantic mode a kNN-only
+//! request, and hybrid mode both, fused client-side with reciprocal rank
+//! fusion (`rrf_fuse`) — rank-based, so there are no score-normalization
+//! coefficients to calibrate, and it runs on ES's free license (the server-
+//! side `rank: { rrf }` API needs a paid license). `matched_ann` stays
+//! per-hit accurate: a hit is an ANN match exactly when it appeared in the
+//! kNN list.
 //!
-//! The index this strategy searches is created by the CDC sync with the
-//! `ik_max_word` analyzer on `content` (see `es.rs::ensure_index`); the
+//! Errors are classed so callers know the failure mode: keyword-mode failures
+//! surface as `RagError::PreFilter` (the tsvector fallback can catch those),
+//! while semantic/hybrid failures surface as `RagError::Ann` because kNN
+//! cannot fall back to tsvector.
+//!
+//! The index is created by `ensure_index` with the `ik_max_word` analyzer on
+//! `content` and an indexed `embedding` `dense_vector` (see `es.rs`); the
 //! search-time analysis in the match query uses the same analyzer so
 //! segmentation is consistent at index and query time.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
-use rag_core::{PreFilterHit, PreFilterStrategy, PreFilterStrategyKind, RagError, RagResult};
+use rag_core::{
+    PreFilterStrategyKind, RagError, RagResult, RankedHit, RetrievalBackend, RetrievalMode,
+    RrfConfig,
+};
 
 use crate::es::{EsClient, EsSearchHit, IK_ANALYZER};
 
-pub struct EsPreFilter {
+/// Max chars for ANN-only snippet fallback (no query clause to highlight).
+const SNIPPET_FALLBACK_LEN: usize = 200;
+
+pub struct EsRetrievalBackend {
     client: EsClient,
     index: String,
+    rrf: RrfConfig,
 }
 
-impl EsPreFilter {
-    pub fn new(client: EsClient, index: impl Into<String>) -> Self {
+impl EsRetrievalBackend {
+    pub fn new(client: EsClient, index: impl Into<String>, rrf: RrfConfig) -> Self {
         Self {
             client,
             index: index.into(),
+            rrf,
         }
     }
 }
 
-/// Maps raw ES hits into `PreFilterHit`s: BM25 `_score` as the raw score and
-/// the first query-aware highlight fragment as the snippet. Pure so it can be
-/// unit-tested without a live cluster.
-fn map_hits(hits: Vec<EsSearchHit>) -> Vec<PreFilterHit> {
+/// Maps raw ES hits into `RankedHit`s: `_score` as the score (BM25, kNN
+/// cosine, or RRF — engine-owned either way), the query-aware highlight as the
+/// snippet when present, and a truncated content fallback for ANN-only hits.
+/// Pure so it can be unit-tested without a live cluster.
+fn map_hits(hits: Vec<EsSearchHit>, matched_ann: bool) -> Vec<RankedHit> {
     hits.into_iter()
-        .map(|h| PreFilterHit {
+        .map(|h| RankedHit {
             id: h.id,
             source: h.source,
-            raw_score: h.score.unwrap_or(0.0),
-            highlighted_snippet: h.highlight.into_iter().next(),
+            score: h.score.unwrap_or(0.0),
+            snippet: if !h.highlight.is_empty() {
+                h.highlight.into_iter().next().unwrap_or_default()
+            } else {
+                h.content
+                    .as_deref()
+                    .map(|c| truncate(c, SNIPPET_FALLBACK_LEN))
+                    .unwrap_or_default()
+            },
             which_strategy: PreFilterStrategyKind::Elasticsearch,
+            matched_ann,
         })
         .collect()
 }
 
+fn truncate(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
+/// Client-side reciprocal rank fusion of the BM25 and kNN result lists. Each
+/// hit contributes `1 / (rank_constant + rank + 1)` per list it appears in
+/// (capped at `window_size` entries per list), mirroring the RRF formula
+/// without needing ES's paid-license `rank: { rrf }` API. A hit that appeared
+/// in the kNN list is an ANN match (`matched_ann: true`), so provenance stays
+/// per-hit accurate. Pure so the fusion math is unit-testable without a
+/// cluster.
+fn rrf_fuse(
+    keyword: Vec<EsSearchHit>,
+    semantic: Vec<EsSearchHit>,
+    limit: usize,
+    rrf: RrfConfig,
+) -> Vec<RankedHit> {
+    struct Fused {
+        source: String,
+        score: f32,
+        snippet: String,
+        content: Option<String>,
+        matched_ann: bool,
+    }
+
+    let mut by_id: HashMap<String, Fused> = HashMap::new();
+    for (hits, matched_ann) in [(keyword, false), (semantic, true)] {
+        for (rank, h) in hits.into_iter().take(rrf.window_size).enumerate() {
+            let entry = by_id.entry(h.id.clone()).or_insert_with(|| Fused {
+                source: h.source.clone(),
+                score: 0.0,
+                snippet: String::new(),
+                content: h.content.clone(),
+                matched_ann,
+            });
+            entry.score += 1.0 / (rrf.rank_constant as f32 + rank as f32 + 1.0);
+            entry.matched_ann = entry.matched_ann || matched_ann;
+            if entry.snippet.is_empty() {
+                entry.snippet = h.highlight.into_iter().next().unwrap_or_default();
+            }
+        }
+    }
+
+    let mut results: Vec<RankedHit> = by_id
+        .into_iter()
+        .map(|(id, mut f)| {
+            if f.snippet.is_empty() {
+                f.snippet = f
+                    .content
+                    .as_deref()
+                    .map(|c| truncate(c, SNIPPET_FALLBACK_LEN))
+                    .unwrap_or_default();
+            }
+            RankedHit {
+                id,
+                source: f.source,
+                score: f.score,
+                snippet: f.snippet,
+                which_strategy: PreFilterStrategyKind::Elasticsearch,
+                matched_ann: f.matched_ann,
+            }
+        })
+        .collect();
+
+    // Score desc, then id asc so ties (e.g. two docs each in one list) are
+    // deterministic across runs.
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    results.truncate(limit);
+    results
+}
+
 #[async_trait]
-impl PreFilterStrategy for EsPreFilter {
-    async fn search(&self, query: &str, limit: usize) -> RagResult<Vec<PreFilterHit>> {
-        let hits = self
-            .client
-            .search(&self.index, query, limit, IK_ANALYZER)
-            .await
-            .map_err(|e| RagError::PreFilter(format!("Elasticsearch search failed: {e}")))?;
-        Ok(map_hits(hits))
+impl RetrievalBackend for EsRetrievalBackend {
+    async fn search(
+        &self,
+        mode: RetrievalMode,
+        keyword: Option<&str>,
+        query_vector: Option<&[f32]>,
+        limit: usize,
+    ) -> RagResult<Vec<RankedHit>> {
+        match mode {
+            RetrievalMode::Keyword => {
+                let query = keyword.ok_or_else(|| {
+                    RagError::PreFilter("keyword mode requires a keyword query".into())
+                })?;
+                let hits = self
+                    .client
+                    .search_keyword(&self.index, query, limit, IK_ANALYZER)
+                    .await
+                    .map_err(|e| RagError::PreFilter(format!("Elasticsearch search failed: {e}")))?;
+                Ok(map_hits(hits, false))
+            }
+            RetrievalMode::Semantic => {
+                let vector = query_vector.ok_or_else(|| {
+                    RagError::Ann("semantic mode requires a query vector".into())
+                })?;
+                let hits = self
+                    .client
+                    .search_semantic(&self.index, vector, limit)
+                    .await
+                    .map_err(|e| RagError::Ann(format!("Elasticsearch kNN search failed: {e}")))?;
+                Ok(map_hits(hits, true))
+            }
+            RetrievalMode::Hybrid => {
+                let query = keyword.ok_or_else(|| {
+                    RagError::Ann("hybrid mode requires a keyword query".into())
+                })?;
+                let vector = query_vector.ok_or_else(|| {
+                    RagError::Ann("hybrid mode requires a query vector".into())
+                })?;
+                let keyword_hits = self
+                    .client
+                    .search_keyword(&self.index, query, limit, IK_ANALYZER)
+                    .await
+                    .map_err(|e| RagError::Ann(format!("Elasticsearch keyword search failed: {e}")))?;
+                let semantic_hits = self
+                    .client
+                    .search_semantic(&self.index, vector, limit)
+                    .await
+                    .map_err(|e| RagError::Ann(format!("Elasticsearch kNN search failed: {e}")))?;
+                Ok(rrf_fuse(keyword_hits, semantic_hits, limit, self.rrf))
+            }
+        }
     }
 }
 
@@ -63,13 +211,110 @@ mod tests {
 
     use crate::es::IK_ANALYZER;
 
+    fn es_hit(id: &str, content: &str, highlights: Vec<&str>) -> EsSearchHit {
+        EsSearchHit {
+            id: id.into(),
+            score: Some(1.0),
+            source: "wiki/zh.md".into(),
+            content: Some(content.into()),
+            highlight: highlights.into_iter().map(String::from).collect(),
+        }
+    }
+
     #[test]
-    fn map_hits_uses_bm25_score_and_first_highlight_fragment() {
+    fn rrf_fuse_combines_ranks_from_both_lists_and_breaks_ties_by_id() {
+        // keyword: a@rank0, b@rank1; semantic: a@rank0, c@rank1.
+        // a = 1/61 + 1/61; b and c = 1/62 each; tie broken by id asc -> b, c.
+        let keyword = vec![
+            es_hit("a", "alpha", vec!["<em>连接</em>失败"]),
+            es_hit("b", "beta", vec![]),
+        ];
+        let semantic = vec![
+            es_hit("a", "alpha", vec![]),
+            es_hit("c", "gamma", vec![]),
+        ];
+        let rrf = RrfConfig::default();
+
+        let fused = rrf_fuse(keyword, semantic, 10, rrf);
+
+        assert_eq!(
+            fused.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        let expected_a = 2.0 / 61.0;
+        assert!(
+            (fused[0].score - expected_a).abs() < 1e-6,
+            "a in both lists scores 2/(k+1), got {}",
+            fused[0].score
+        );
+        assert!(
+            (fused[1].score - 1.0 / 62.0).abs() < 1e-6,
+            "single-list docs score 1/(k+rank+1), got {}",
+            fused[1].score
+        );
+    }
+
+    #[test]
+    fn rrf_fuse_flags_ann_matches_from_knn_presence() {
+        let keyword = vec![es_hit("both", "x", vec![]), es_hit("kw", "y", vec![])];
+        let semantic = vec![es_hit("both", "x", vec![]), es_hit("ann", "z", vec![])];
+
+        let fused = rrf_fuse(keyword, semantic, 10, RrfConfig::default());
+        let by_id = |id: &str| fused.iter().find(|h| h.id == id).unwrap();
+
+        assert!(by_id("both").matched_ann, "present in the kNN list is an ANN match");
+        assert!(!by_id("kw").matched_ann, "keyword-only hit is not an ANN match");
+        assert!(by_id("ann").matched_ann, "kNN-only hit is an ANN match");
+    }
+
+    #[test]
+    fn rrf_fuse_uses_keyword_highlight_else_truncated_snippet() {
+        let long = "系统发生连接失败错误码需要重试。".repeat(50);
+        let keyword = vec![es_hit("a", &long, vec!["<em>连接</em>失败错误码"])];
+        let semantic = vec![es_hit("b", &long, vec![])];
+
+        let fused = rrf_fuse(keyword, semantic, 10, RrfConfig::default());
+        let by_id = |id: &str| fused.iter().find(|h| h.id == id).unwrap();
+
+        assert_eq!(by_id("a").snippet, "<em>连接</em>失败错误码", "keyword highlight wins");
+        assert!(
+            by_id("b").snippet.starts_with("系统") && by_id("b").snippet.ends_with('…'),
+            "ANN-only hits fall back to a truncated content snippet"
+        );
+    }
+
+    #[test]
+    fn rrf_fuse_respects_window_size_and_limit() {
+        // window_size=1: only rank0 of each list contributes, so b (keyword
+        // rank1) and c (semantic rank1) both drop out entirely.
+        let keyword = vec![es_hit("a", "alpha", vec![]), es_hit("b", "beta", vec![])];
+        let semantic = vec![es_hit("a", "alpha", vec![]), es_hit("c", "gamma", vec![])];
+        let rrf = RrfConfig { window_size: 1, rank_constant: 60 };
+
+        let fused = rrf_fuse(keyword.clone(), semantic.clone(), 10, rrf);
+        assert_eq!(
+            fused.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "docs outside the per-list window are excluded"
+        );
+
+        let limited = rrf_fuse(keyword, semantic, 1, RrfConfig::default());
+        assert_eq!(
+            limited.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a"],
+            "limit truncates after fusion"
+        );
+    }
+
+    #[test]
+    fn map_hits_uses_highlight_when_present_and_truncates_content_otherwise() {
+        let long_content = "系统发生连接失败错误码需要重试。".repeat(50);
         let hits = vec![
             EsSearchHit {
                 id: "doc-1".into(),
                 score: Some(2.5),
                 source: "wiki/zh.md".into(),
+                content: Some(long_content.clone()),
                 highlight: vec![
                     "系统发生<em>连接</em>".into(),
                     "<em>失败</em>错误码".into(),
@@ -79,17 +324,48 @@ mod tests {
                 id: "doc-2".into(),
                 score: None,
                 source: "wiki/errors.md".into(),
+                content: Some(long_content.clone()),
+                highlight: vec![],
+            },
+            EsSearchHit {
+                id: "doc-3".into(),
+                score: Some(0.4),
+                source: "wiki/empty.md".into(),
+                content: None,
                 highlight: vec![],
             },
         ];
 
-        let mapped = map_hits(hits);
+        let mapped = map_hits(hits, true);
         assert_eq!(mapped[0].id, "doc-1");
-        assert_eq!(mapped[0].raw_score, 2.5);
-        assert_eq!(mapped[0].highlighted_snippet.as_deref(), Some("系统发生<em>连接</em>"));
+        assert_eq!(mapped[0].score, 2.5);
+        assert_eq!(mapped[0].snippet, "系统发生<em>连接</em>");
+        assert!(mapped[0].matched_ann);
         assert_eq!(mapped[0].which_strategy, PreFilterStrategyKind::Elasticsearch);
-        assert_eq!(mapped[1].raw_score, 0.0, "missing score defaults to 0");
-        assert_eq!(mapped[1].highlighted_snippet, None);
+
+        // No highlight -> content truncation fallback.
+        assert!(mapped[1].snippet.starts_with("系统发生连接失败"));
+        assert!(
+            mapped[1].snippet.chars().count() <= SNIPPET_FALLBACK_LEN + 1,
+            "fallback snippet should be capped at the fallback length"
+        );
+        assert_eq!(mapped[1].score, 0.0, "missing score defaults to 0");
+
+        // No content at all -> empty snippet, not an error.
+        assert_eq!(mapped[2].snippet, "");
+    }
+
+    #[test]
+    fn map_hits_keyword_mode_reports_no_ann() {
+        let hits = vec![EsSearchHit {
+            id: "doc-1".into(),
+            score: Some(1.0),
+            source: "wiki/api.md".into(),
+            content: None,
+            highlight: vec![],
+        }];
+        let mapped = map_hits(hits, false);
+        assert!(!mapped[0].matched_ann, "keyword hits never matched via ANN");
     }
 
     // Real-Elasticsearch integration tests, mirroring the Postgres test
@@ -130,55 +406,73 @@ mod tests {
         assert!(resp.status().is_success(), "index cleanup should succeed");
     }
 
-    /// ES is near-real-time: poll the strategy until the expected id is
-    /// visible (or give up after a few seconds).
+    /// A deterministic pseudo-random vector seeded by `seed`, so two fixtures
+    /// built with different seeds are far apart in cosine space and a query
+    /// vector lands closest to its own fixture (used in place of real BGE-M3
+    /// embeddings so these tests don't need an embedder).
+    fn vec(seed: u32, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|i| ((seed as f64) + (i as f64) * 1.7).sin() as f32)
+            .collect()
+    }
+
+    fn backend(client: EsClient, index: String) -> EsRetrievalBackend {
+        EsRetrievalBackend::new(client, index, RrfConfig::default())
+    }
+
+    /// ES is near-real-time: poll until the expected id is visible (or give
+    /// up after a few seconds).
     async fn search_until_visible(
-        strategy: &EsPreFilter,
+        backend: &EsRetrievalBackend,
         query: &str,
         expected_id: &str,
-    ) -> Vec<PreFilterHit> {
+    ) -> Vec<RankedHit> {
         for _ in 0..20 {
-            let hits = strategy.search(query, 10).await.expect("search should succeed");
+            let hits = backend
+                .search(RetrievalMode::Keyword, Some(query), None, 10)
+                .await
+                .expect("search should succeed");
             if hits.iter().any(|h| h.id == expected_id) {
                 return hits;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        strategy.search(query, 10).await.expect("search should succeed")
+        backend
+            .search(RetrievalMode::Keyword, Some(query), None, 10)
+            .await
+            .expect("search should succeed")
     }
 
     #[tokio::test]
-    async fn chinese_phrase_query_returns_segmented_match_with_highlight() {
+    async fn keyword_search_returns_segmented_match_with_highlight() {
         let Some(client) = test_client().await else {
             eprintln!("skipping: RAG_MCP_ELASTICSEARCH_URL not set");
             return;
         };
         let index = unique_index(&client).await;
         client
-            .index_document(&index, "zh-1", "wiki/zh.md", "系统发生连接失败错误码需要重试")
+            .index_document(&index, "zh-1", "wiki/zh.md", "系统发生连接失败错误码需要重试", None)
             .await
             .expect("indexing should succeed");
         client
-            .index_document(&index, "zh-2", "wiki/zh.md", "今天天气晴朗适合外出")
+            .index_document(&index, "zh-2", "wiki/zh.md", "今天天气晴朗适合外出", None)
             .await
             .expect("indexing should succeed");
 
-        let strategy = EsPreFilter::new(client.clone(), index.clone());
-        let hits = search_until_visible(&strategy, "连接失败", "zh-1").await;
+        let backend = backend(client.clone(), index.clone());
+        let hits = search_until_visible(&backend, "连接失败", "zh-1").await;
 
         let first = hits
             .iter()
             .find(|h| h.id == "zh-1")
             .expect("zh-1 should be in results");
         assert_eq!(first.which_strategy, PreFilterStrategyKind::Elasticsearch);
+        assert!(!first.matched_ann, "keyword request carries no kNN clause");
+        assert!(first.score > 0.0, "BM25 score should be positive for a real match");
         assert!(
-            first.raw_score > 0.0,
-            "BM25 score should be positive for a real match"
-        );
-        let snippet = first.highlighted_snippet.as_deref().expect("ES hit should have a highlight");
-        assert!(
-            snippet.contains("<em>连接</em>") && snippet.contains("<em>失败</em>"),
-            "highlight should surface the segmented match terms in context, got: {snippet}"
+            first.snippet.contains("<em>连接</em>") && first.snippet.contains("<em>失败</em>"),
+            "highlight should surface the segmented match terms in context, got: {}",
+            first.snippet
         );
 
         cleanup_index(&client, &index).await;
@@ -193,12 +487,12 @@ mod tests {
         let index = unique_index(&client).await;
         let token = crate::testutil::unique_token("es-code");
         client
-            .index_document(&index, "code-1", "wiki/errors.md", &format!("ERROR_{token}: connection refused"))
+            .index_document(&index, "code-1", "wiki/errors.md", &format!("ERROR_{token}: connection refused"), None)
             .await
             .expect("indexing should succeed");
 
-        let strategy = EsPreFilter::new(client.clone(), index.clone());
-        let hits = search_until_visible(&strategy, &token, "code-1").await;
+        let backend = backend(client.clone(), index.clone());
+        let hits = search_until_visible(&backend, &token, "code-1").await;
 
         assert!(
             hits.iter().any(|h| h.id == "code-1"),
@@ -216,14 +510,17 @@ mod tests {
         };
         let index = unique_index(&client).await;
         client
-            .index_document(&index, "n-1", "wiki/zh.md", "系统发生连接失败")
+            .index_document(&index, "n-1", "wiki/zh.md", "系统发生连接失败", None)
             .await
             .expect("indexing should succeed");
 
-        let strategy = EsPreFilter::new(client.clone(), index.clone());
+        let backend = backend(client.clone(), index.clone());
         // A token never indexed anywhere.
         let token = crate::testutil::unique_token("es-absent");
-        let hits = strategy.search(&token, 10).await.expect("search should succeed");
+        let hits = backend
+            .search(RetrievalMode::Keyword, Some(&token), None, 10)
+            .await
+            .expect("search should succeed");
 
         assert!(hits.is_empty());
 
@@ -231,35 +528,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn limit_is_respected() {
+    async fn semantic_search_ranks_knn_hits_by_cosine_similarity() {
         let Some(client) = test_client().await else {
             eprintln!("skipping: RAG_MCP_ELASTICSEARCH_URL not set");
             return;
         };
         let index = unique_index(&client).await;
-        for i in 0..3 {
-            client
-                .index_document(&index, &format!("lim-{i}"), "wiki/zh.md", &format!("支付接口调用失败需要处理案例{i}"))
-                .await
-                .expect("indexing should succeed");
-        }
+        let prefix = crate::testutil::unique_token("sem");
+        let id_a = format!("{prefix}-a");
+        let id_b = format!("{prefix}-b");
+        let va = vec(1, 1024);
+        let vb = vec(2, 1024);
+        client
+            .index_document(&index, &id_a, "wiki/api.md", &format!("alpha {prefix}"), Some(&va))
+            .await
+            .expect("indexing should succeed");
+        client
+            .index_document(&index, &id_b, "wiki/errors.md", &format!("beta {prefix}"), Some(&vb))
+            .await
+            .expect("indexing should succeed");
 
-        let strategy = EsPreFilter::new(client.clone(), index.clone());
-        // Poll until the docs are searchable (all three contain "失败"), then
-        // assert a limit-2 search caps the count.
+        let backend = backend(client.clone(), index.clone());
+        // Query close to `va` (same seed), so `id_a` must rank first. Poll
+        // until the fixtures are searchable.
+        let mut hits = Vec::new();
         for _ in 0..20 {
-            if !strategy.search("失败", 10).await.expect("search should succeed").is_empty() {
+            hits = backend
+                .search(RetrievalMode::Semantic, None, Some(&va), 10)
+                .await
+                .expect("kNN search should succeed");
+            if hits.iter().any(|h| h.id.starts_with(&prefix)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let hits = strategy.search("失败", 2).await.expect("search should succeed");
 
-        assert!(!hits.is_empty(), "docs should be searchable by now");
+        let ids: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.id.starts_with(&prefix))
+            .map(|h| h.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![id_a.as_str(), id_b.as_str()], "closest fixture should rank first");
+        let top = hits
+            .iter()
+            .find(|h| h.id == id_a)
+            .expect("id_a should be present");
+        assert!(top.matched_ann, "kNN request means hits came via ANN");
+        assert!(top.score > 0.9, "near-identical vector should score near 1.0");
         assert!(
-            hits.len() <= 2,
-            "limit=2 should cap results even though 3 rows match, got {}",
-            hits.len()
+            top.snippet.starts_with("alpha"),
+            "ANN-only hits fall back to a truncated content snippet"
+        );
+
+        cleanup_index(&client, &index).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_fuses_keyword_and_knn_clauses() {
+        let Some(client) = test_client().await else {
+            eprintln!("skipping: RAG_MCP_ELASTICSEARCH_URL not set");
+            return;
+        };
+        let index = unique_index(&client).await;
+        let va = vec(1, 1024);
+        let vb = vec(2, 1024);
+        client
+            .index_document(&index, "hy-1", "wiki/zh.md", "系统发生连接失败错误码需要重试", Some(&va))
+            .await
+            .expect("indexing should succeed");
+        client
+            .index_document(&index, "hy-2", "wiki/zh.md", "今天天气晴朗适合外出", Some(&vb))
+            .await
+            .expect("indexing should succeed");
+
+        let backend = backend(client.clone(), index.clone());
+        // hy-1 matches the keyword clause AND is kNN-near the query vector;
+        // hy-2 matches only the kNN clause. Client-side RRF must return both,
+        // rank hy-1 first (it appears in both ranked lists), and keep scores
+        // positive.
+        let mut hits = Vec::new();
+        for _ in 0..20 {
+            hits = backend
+                .search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10)
+                .await
+                .expect("hybrid search should succeed");
+            if hits.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        assert_eq!(hits.len(), 2, "both the keyword match and the kNN match should surface");
+        assert_eq!(hits[0].id, "hy-1", "doc matched by both clauses ranks first under RRF");
+        let hy1 = &hits[0];
+        assert!(hy1.matched_ann, "hy-1 appeared in the kNN list, so it is an ANN match");
+        assert!(
+            hy1.snippet.contains("<em>连接</em>"),
+            "the keyword-clause highlight survives client-side fusion"
+        );
+        let hy2 = hits.iter().find(|h| h.id == "hy-2").expect("kNN-only doc should be present");
+        assert!(hy2.matched_ann, "kNN-only doc is an ANN match");
+        assert!(hy2.score > 0.0, "RRF scores should be positive");
+        assert!(
+            hy2.snippet.starts_with("今天"),
+            "ANN-only hits fall back to a truncated content snippet"
         );
 
         cleanup_index(&client, &index).await;

@@ -1,33 +1,53 @@
-//! Postgres `tsvector` `PreFilterStrategy` — the pre-filter path for
-//! English/code content (identifiers, error codes) per SPEC.md. Queries the
-//! `documents` table's generated `search_vector` column (see
-//! `migrations/0001_documents.sql`), ranking with `ts_rank` and producing a
-//! query-aware snippet via `ts_headline` so results carry a highlighted
-//! match in context (SPEC.md user story 7), matching the shape ES-backed
-//! results provide.
+//! Postgres `tsvector` keyword fallback `RetrievalBackend` — the exact-term
+//! path for English/code content (identifiers, error codes) when Elasticsearch
+//! errors mid-flight or hasn't caught up. Queries the `documents` table's
+//! generated `search_vector` column (see `migrations/0001_documents.sql`),
+//! ranking with `ts_rank` and producing a query-aware snippet via
+//! `ts_headline` so results carry a highlighted match in context, matching the
+//! shape ES-backed results provide.
+//!
+//! Keyword-only: semantic and hybrid modes return a clear error, because kNN
+//! cannot fall back to tsvector — the fallback wrapper only ever routes the
+//! keyword facet here.
 //!
 //! `simple` config is used throughout (not `english`) to avoid stemming
 //! mangling identifier-style tokens — see the migration file for the full
 //! rationale.
 
 use async_trait::async_trait;
-use rag_core::{PreFilterHit, PreFilterStrategy, PreFilterStrategyKind, RagError, RagResult};
+use rag_core::{
+    PreFilterStrategyKind, RagError, RagResult, RankedHit, RetrievalBackend, RetrievalMode,
+};
 use sqlx::PgPool;
 use sqlx::Row;
 
-pub struct TsvectorPreFilter {
+pub struct TsvectorRetrievalBackend {
     pool: PgPool,
 }
 
-impl TsvectorPreFilter {
+impl TsvectorRetrievalBackend {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 }
 
 #[async_trait]
-impl PreFilterStrategy for TsvectorPreFilter {
-    async fn search(&self, query: &str, limit: usize) -> RagResult<Vec<PreFilterHit>> {
+impl RetrievalBackend for TsvectorRetrievalBackend {
+    async fn search(
+        &self,
+        mode: RetrievalMode,
+        keyword: Option<&str>,
+        _query_vector: Option<&[f32]>,
+        limit: usize,
+    ) -> RagResult<Vec<RankedHit>> {
+        if !matches!(mode, RetrievalMode::Keyword) {
+            return Err(RagError::PreFilter(
+                "tsvector fallback supports keyword mode only — semantic and hybrid queries need Elasticsearch".into(),
+            ));
+        }
+        let query = keyword.ok_or_else(|| {
+            RagError::PreFilter("keyword mode requires a keyword query".into())
+        })?;
         // `websearch_to_tsquery` tolerates arbitrary user input (quotes,
         // punctuation) without raising a syntax error, unlike
         // `to_tsquery`/`plainto_tsquery`'s stricter operator parsing --
@@ -55,12 +75,13 @@ impl PreFilterStrategy for TsvectorPreFilter {
 
         Ok(rows
             .into_iter()
-            .map(|row| PreFilterHit {
+            .map(|row| RankedHit {
                 id: row.get::<String, _>("id"),
                 source: row.get::<String, _>("source"),
-                raw_score: row.get::<f32, _>("rank"),
-                highlighted_snippet: Some(row.get::<String, _>("snippet")),
+                score: row.get::<f32, _>("rank"),
+                snippet: row.get::<String, _>("snippet"),
                 which_strategy: PreFilterStrategyKind::Tsvector,
+                matched_ann: false,
             })
             .collect())
     }
@@ -137,13 +158,17 @@ mod tests {
         )
         .await;
 
-        let strategy = TsvectorPreFilter::new(pool.clone());
-        let hits = strategy.search(&token, 10).await.unwrap();
+        let backend = TsvectorRetrievalBackend::new(pool.clone());
+        let hits = backend
+            .search(RetrievalMode::Keyword, Some(&token), None, 10)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 1, "expected exactly one match for a unique token");
         assert_eq!(hits[0].id, id);
         assert_eq!(hits[0].which_strategy, PreFilterStrategyKind::Tsvector);
-        assert!(hits[0].highlighted_snippet.is_some());
+        assert!(!hits[0].matched_ann);
+        assert!(!hits[0].snippet.is_empty());
 
         cleanup(&pool, "tsv-errcode").await;
     }
@@ -167,8 +192,11 @@ mod tests {
         )
         .await;
 
-        let strategy = TsvectorPreFilter::new(pool.clone());
-        let hits = strategy.search(&fn_name, 10).await.unwrap();
+        let backend = TsvectorRetrievalBackend::new(pool.clone());
+        let hits = backend
+            .search(RetrievalMode::Keyword, Some(&fn_name), None, 10)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, id);
@@ -184,9 +212,12 @@ mod tests {
         };
         let token = unique_token("nomatch");
 
-        let strategy = TsvectorPreFilter::new(pool.clone());
+        let backend = TsvectorRetrievalBackend::new(pool.clone());
         // Never inserted anywhere -- guaranteed no match.
-        let hits = strategy.search(&token, 10).await.unwrap();
+        let hits = backend
+            .search(RetrievalMode::Keyword, Some(&token), None, 10)
+            .await
+            .unwrap();
 
         assert!(hits.is_empty());
     }
@@ -210,11 +241,33 @@ mod tests {
             .await;
         }
 
-        let strategy = TsvectorPreFilter::new(pool.clone());
-        let hits = strategy.search(&token, 2).await.unwrap();
+        let backend = TsvectorRetrievalBackend::new(pool.clone());
+        let hits = backend
+            .search(RetrievalMode::Keyword, Some(&token), None, 2)
+            .await
+            .unwrap();
 
         assert_eq!(hits.len(), 2, "limit=2 should cap results even though 3 rows match");
 
         cleanup(&pool, &id_prefix).await;
+    }
+
+    #[tokio::test]
+    async fn semantic_and_hybrid_modes_return_clear_error() {
+        let Some(pool) = test_pool().await else {
+            eprintln!("skipping: RAG_MCP_DATABASE_URL not set");
+            return;
+        };
+        let backend = TsvectorRetrievalBackend::new(pool);
+        let err = backend
+            .search(RetrievalMode::Hybrid, Some("连接失败"), Some(&[0.1f32]), 10)
+            .await
+            .expect_err("tsvector must refuse non-keyword modes");
+        match err {
+            RagError::PreFilter(msg) => {
+                assert!(msg.contains("keyword mode only"), "got: {msg}");
+            }
+            other => panic!("expected PreFilter error, got {other:?}"),
+        }
     }
 }

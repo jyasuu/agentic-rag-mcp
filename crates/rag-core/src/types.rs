@@ -2,10 +2,12 @@ use serde::{Deserialize, Serialize};
 
 /// How the caller wants `search` to run the funnel.
 ///
-/// `Hybrid` is the default: pre-filter always runs; ANN runs only if the
-/// pre-filter stage doesn't return confident results (see
-/// `ShortCircuitConfig`). `Keyword` and `Semantic` let an agent bypass the
-/// funnel's own judgment when it already knows the query shape.
+/// `Hybrid` is the default: Elasticsearch fuses the keyword (BM25) and
+/// semantic (kNN) clauses natively with reciprocal rank fusion (RRF), so
+/// relevance is decided by one engine's ranking rather than a hand-rolled
+/// score merge. `Keyword` and `Semantic` let an agent bypass the fuse when it
+/// already knows the query shape. Maps 1:1 onto `RetrievalMode`, which the
+/// funnel hands to the retrieval backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
@@ -13,6 +15,27 @@ pub enum SearchMode {
     Semantic,
     #[default]
     Hybrid,
+}
+
+/// The retrieval dispatch mode passed to `RetrievalBackend::search`. Kept
+/// separate from the caller-facing `SearchMode` so the backend contract
+/// (which request shape to build) doesn't inherit the MCP-facing serde type's
+/// `Default`/serialization semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalMode {
+    Keyword,
+    Semantic,
+    Hybrid,
+}
+
+impl From<SearchMode> for RetrievalMode {
+    fn from(mode: SearchMode) -> Self {
+        match mode {
+            SearchMode::Keyword => RetrievalMode::Keyword,
+            SearchMode::Semantic => RetrievalMode::Semantic,
+            SearchMode::Hybrid => RetrievalMode::Hybrid,
+        }
+    }
 }
 
 /// Optional narrowing filters a caller can pass to `search` / `keyword_search`
@@ -24,21 +47,26 @@ pub struct SearchFilters {
     pub language: Option<String>,
 }
 
-/// A hit returned by a pre-filter strategy (tsvector / pg_trgm /
-/// Elasticsearch), before ANN or scoring has run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreFilterHit {
+/// A single hit returned by a `RetrievalBackend`, unifying keyword (BM25),
+/// semantic (kNN), and hybrid (RRF) results so the funnel can produce
+/// `ScoredResult`s directly. Replaces the `PreFilterHit` / `AnnHit` split.
+#[derive(Debug, Clone)]
+pub struct RankedHit {
     pub id: String,
     pub source: String,
-    /// Strategy-native relevance score (e.g. ES BM25 score, ts_rank,
-    /// trigram similarity). Not comparable across strategies without
-    /// normalization — `ScoringConfig` is responsible for that.
-    pub raw_score: f32,
-    /// Pre-rendered snippet, e.g. from ES highlight. `None` for strategies
-    /// that don't produce one (pg_trgm), in which case the funnel falls
-    /// back to truncation.
-    pub highlighted_snippet: Option<String>,
+    /// Engine-native score: BM25 for keyword, cosine similarity for semantic,
+    /// and the RRF score for hybrid. Ranges are engine-specific and NOT
+    /// normalized — Elasticsearch owns the ranking.
+    pub score: f32,
+    /// Rendered snippet: `<em>`-highlighted for BM25 matches, truncated for
+    /// ANN-only hits (there is no query clause to highlight).
+    pub snippet: String,
+    /// Which strategy produced the hit. Request-level: for an ES hybrid
+    /// request every hit reports Elasticsearch, since RRF responses don't
+    /// expose which clause matched.
     pub which_strategy: PreFilterStrategyKind,
+    /// Whether the request carried a kNN clause (request-level, not per-hit).
+    pub matched_ann: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,22 +74,10 @@ pub struct PreFilterHit {
 pub enum PreFilterStrategyKind {
     Elasticsearch,
     Tsvector,
-    Trigram,
 }
 
-/// A hit returned by the ANN (pgvector) stage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnnHit {
-    pub id: String,
-    pub source: String,
-    /// Cosine/L2 similarity, strategy-defined range.
-    pub similarity: f32,
-    /// Raw content used to produce a fallback truncated snippet, since ANN
-    /// hits have no query-aware highlight (see opportunity list).
-    pub content_preview: String,
-}
-
-/// Final, scored, snippet-level result returned to the MCP caller.
+/// Final, ranked result returned to the MCP caller. Shape is stable so
+/// existing tool-use patterns keep working.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredResult {
     pub id: String,

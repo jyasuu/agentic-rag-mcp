@@ -1,19 +1,27 @@
 use async_trait::async_trait;
 
-use crate::types::{AnnHit, Document, PreFilterHit, RagResult};
+use crate::types::{Document, RagResult, RankedHit, RetrievalMode};
 
-/// One `FieldRule`-style pre-filter strategy (tsvector, pg_trgm, or
-/// Elasticsearch). Each content type in the corpus maps to one of these;
-/// `RetrievalFunnel` may query more than one and merge results.
+/// The single retrieval backend — Elasticsearch in production, wrapped by a
+/// Postgres tsvector keyword fallback. Replaces the `PreFilterStrategy` list +
+/// `AnnClient` split: one engine owns ranking (BM25 / kNN / RRF), so the
+/// funnel has no cross-engine score merge to calibrate.
+///
+/// Decision-rich signature: the mode plus the optional keyword and query
+/// vector tell the backend exactly which request shape to build.
 #[async_trait]
-pub trait PreFilterStrategy: Send + Sync {
-    async fn search(&self, query: &str, limit: usize) -> RagResult<Vec<PreFilterHit>>;
-}
-
-/// pgvector ANN search, given a pre-computed query embedding.
-#[async_trait]
-pub trait AnnClient: Send + Sync {
-    async fn search(&self, embedding: &[f32], limit: usize) -> RagResult<Vec<AnnHit>>;
+pub trait RetrievalBackend: Send + Sync {
+    /// Keyword: keyword = Some(query), query_vector = None → BM25-only.
+    /// Semantic: keyword = None, query_vector = Some(embedding) → kNN-only.
+    /// Hybrid: keyword = Some(query), query_vector = Some(embedding) →
+    /// fused BM25 + kNN request with reciprocal rank fusion.
+    async fn search(
+        &self,
+        mode: RetrievalMode,
+        keyword: Option<&str>,
+        query_vector: Option<&[f32]>,
+        limit: usize,
+    ) -> RagResult<Vec<RankedHit>>;
 }
 
 /// Local embedding model (BGE-M3 via `ort` in production). Kept as a trait

@@ -1,5 +1,4 @@
 mod auth;
-mod ann;
 mod config;
 mod embedder;
 mod es;
@@ -12,7 +11,6 @@ mod state;
 mod store;
 #[cfg(test)]
 mod testutil;
-mod trigram;
 mod tsvector;
 mod wiring;
 
@@ -41,10 +39,10 @@ async fn main() -> anyhow::Result<()> {
     // call.
     let app_state = AppState::connect(&config).await?;
 
-    // The real backends: tsvector + ES(ik)/pg_trgm-fallback pre-filters,
-    // pgvector ANN, BGE-M3 embedder, and the Postgres content store — see
-    // `wiring.rs` for the funnel construction (shared with integration
-    // tests).
+    // The real backends: Elasticsearch retrieval (BM25 / kNN / RRF) with the
+    // Postgres tsvector keyword fallback, the BGE-M3 embedder, and the
+    // Postgres content store — see `wiring.rs` for the funnel construction
+    // (shared with integration tests).
     let funnel = build_funnel(&config, app_state)?;
 
     let rag_server = RagMcpServer::new(funnel.clone());

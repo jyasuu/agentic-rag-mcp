@@ -88,6 +88,7 @@
   <text x="436" y="619" font-size="11" fill="#334155">match + highlight &lt;em&gt;…&lt;/em&gt; fragment</text>
   <text x="436" y="641" font-size="11" fill="#334155">near-real-time — ~1s to be searchable</text>
   <text x="436" y="658" font-size="11" fill="#334155">pg_trgm fallback covers ES-down / unsynced</text>
+  <text x="436" y="674" font-size="11" fill="#334155">keyword only — no vectors (ANN in pgvector)</text>
   <text x="436" y="684" font-size="10" fill="#475569">seeded by 03-seed.sh (ES mirror)</text>
 
   <!-- Embedder -->

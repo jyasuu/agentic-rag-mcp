@@ -1,8 +1,10 @@
 //! End-to-end integration tests for the *wiring* — the real funnel built by
 //! `build_funnel` (the exact code path `main` runs), exercised through the
-//! funnel's public API. The funnel logic itself is already unit-tested in
-//! `rag-core`; these tests cover the "integration wiring only" ticket: do the
-//! real backends, wired together, actually answer searches?
+//! funnel's public API. This is the primary test seam: the funnel over a real
+//! Elasticsearch cluster that has the `dense_vector` index and real
+//! embeddings. The funnel logic itself is unit-tested in `rag-core` with a
+//! fake backend; these tests cover "do the real backends, wired together,
+//! actually answer searches?"
 //!
 //! Env-gated like every backend test in this crate: they run only when
 //! `RAG_MCP_DATABASE_URL`, `RAG_MCP_ELASTICSEARCH_URL`, and an embedding
@@ -21,16 +23,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rag_core::{Embedder, RetrievalFunnel, SearchFilters, SearchMode};
+use rag_core::{Embedder, PreFilterStrategyKind, RetrievalFunnel, SearchFilters, SearchMode};
 
 use crate::config::Config;
 use crate::embedder::{BgeM3Embedder, OllamaEmbedder};
 use crate::es::EsClient;
 use crate::es::IK_ANALYZER;
 use crate::state::AppState;
-use crate::testutil::{
-    apply_schema, cleanup_documents, insert_document, test_pool, unique_token,
-};
+use crate::testutil::{apply_schema, cleanup_documents, insert_document, test_pool, unique_token};
 use crate::wiring::build_funnel;
 
 struct Integration {
@@ -59,7 +59,7 @@ async fn integration() -> Option<Arc<Integration>> {
 
     apply_schema(&pool).await;
     // Generous timeout: this suite runs against the same single-node
-    // cluster as the ES pre-filter tests, concurrently.
+    // cluster as the ES backend tests, concurrently.
     let es = EsClient::new(&es_url, Duration::from_secs(30))
         .expect("RAG_MCP_ELASTICSEARCH_URL set but client failed to build");
     let index = format!("rag-itg-{}", unique_token("idx"));
@@ -77,6 +77,7 @@ async fn integration() -> Option<Arc<Integration>> {
         ollama_url: embed.ollama_url.clone(),
         ollama_model: embed.ollama_model.clone(),
         connect_timeout: Duration::from_secs(5),
+        rrf: rag_core::RrfConfig::default(),
     };
     let funnel = build_funnel(
         &config,
@@ -115,6 +116,26 @@ fn model_dir_backend() -> Option<EmbedBackend> {
     })
 }
 
+/// A temporary embedder for seeding the ES index with real embeddings (the
+/// same backend the funnel will use for query-side embedding, so indexing and
+/// query vectors live in the same space).
+fn seeder_embedder() -> Box<dyn Embedder> {
+    match std::env::var("RAG_MCP_OLLAMA_URL").ok() {
+        Some(url) => Box::new(
+            OllamaEmbedder::new(
+                url,
+                std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into()),
+            )
+            .expect("ollama client should build"),
+        ),
+        None => {
+            let model_dir = std::env::var("RAG_MCP_EMBEDDING_MODEL_DIR")
+                .expect("set in integration()");
+            Box::new(BgeM3Embedder::load(std::path::Path::new(&model_dir)).expect("model loads"))
+        }
+    }
+}
+
 /// ES is near-real-time: poll until `id` is searchable in the shared index.
 async fn search_until_visible(itg: &Integration, query: &str, id: &str) {
     for _ in 0..40 {
@@ -147,7 +168,11 @@ async fn keyword_search_returns_tsvector_hits_end_to_end() {
     )
     .await;
 
-    let hits = itg.funnel.keyword_search(&token, None).await.expect("keyword search should work");
+    let hits = itg
+        .funnel
+        .keyword_search(&token, None)
+        .await
+        .expect("keyword search should work");
 
     assert!(
         hits.iter().any(|h| h.id == id),
@@ -159,32 +184,42 @@ async fn keyword_search_returns_tsvector_hits_end_to_end() {
 }
 
 #[tokio::test]
-async fn keyword_search_falls_back_to_pg_trgm_for_chinese() {
+async fn keyword_search_returns_elasticsearch_hits_for_chinese_end_to_end() {
     let Some(itg) = integration().await else {
         return;
     };
-    let token = unique_token("trgm");
-    // The unique token is pure hex (from the testutil `unique_term` style) so
-    // trigram similarity, not ES, is what matches: this exercises the
-    // fallback branch of `FallbackPreFilter` (ES has no match -> pg_trgm).
-    let term = crate::testutil::unique_term();
+    let token = unique_token("es-cn");
     let id = format!("itg-{token}");
-    insert_document(
-        &itg.pool,
-        &id,
-        "wiki/zh.md",
-        &format!("系统发生错误 {term} 需要立即处理"),
-    )
-    .await;
+    itg.es
+        .index_document(
+            &itg.index,
+            &id,
+            "wiki/zh.md",
+            &format!("系统发生连接失败错误码需要重试 {token}"),
+            None,
+        )
+        .await
+        .expect("indexing should succeed");
 
-    let hits = itg.funnel.keyword_search(&term, None).await.expect("keyword search should work");
+    search_until_visible(&itg, "连接失败", &id).await;
+    let hits = itg
+        .funnel
+        .keyword_search("连接失败", None)
+        .await
+        .expect("keyword search should work");
 
+    let hit = hits
+        .iter()
+        .find(|h| h.id == id)
+        .expect("ES-backed Chinese doc should surface");
+    assert_eq!(hit.matched_via, vec![PreFilterStrategyKind::Elasticsearch]);
+    assert!(!hit.matched_ann, "keyword mode carries no kNN clause");
     assert!(
-        hits.iter().any(|h| h.id == id),
-        "pg_trgm fallback should surface {id}, got {hits:?}"
+        hit.snippet.contains("<em>连接</em>") && hit.snippet.contains("<em>失败</em>"),
+        "ES keyword hits keep their <em> highlight, got: {}",
+        hit.snippet
     );
 
-    cleanup_documents(&itg.pool, "itg-trgm").await;
     cleanup_es_doc(&itg, &id).await;
 }
 
@@ -198,40 +233,48 @@ async fn vector_search_returns_semantic_results_end_to_end() {
     let id_a = format!("itg-{token}-apple");
     let id_b = format!("itg-{token}-physics");
 
-    // Seed embeddings with a temporary embedder (dropped before the shared
-    // funnel's query-side embedding runs, keeping memory flat). Prefer the
-    // remote Ollama backend when configured; fall back to the local ONNX
-    // session.
-    let seeder: Box<dyn Embedder> = match std::env::var("RAG_MCP_OLLAMA_URL").ok() {
-        Some(url) => Box::new(
-            OllamaEmbedder::new(
-                url,
-                std::env::var("RAG_MCP_OLLAMA_MODEL").unwrap_or_else(|_| "bge-m3".into()),
-            )
-            .expect("ollama client should build"),
-        ),
-        None => {
-            let model_dir = std::env::var("RAG_MCP_EMBEDDING_MODEL_DIR").expect("set in integration()");
-            Box::new(BgeM3Embedder::load(std::path::Path::new(&model_dir)).expect("model loads"))
-        }
-    };
+    // Seed embeddings into Elasticsearch (the only vector store now), using a
+    // temporary embedder dropped before the shared funnel's query-side
+    // embedding runs, keeping memory flat.
+    let seeder = seeder_embedder();
     let va = seeder.embed("苹果汁的制作方法介绍").await.expect("embed a");
     let vb = seeder.embed("量子力学的基本理论").await.expect("embed b");
-
-    insert_document(&pool, &id_a, "wiki/zh.md", &format!("苹果汁的制作方法介绍 {token}")).await;
-    insert_document(&pool, &id_b, "wiki/zh.md", &format!("量子力学的基本理论 {token}")).await;
-    insert_embedding(&pool, &id_a, &va).await;
-    insert_embedding(&pool, &id_b, &vb).await;
     drop(seeder);
 
-    let hits = itg.funnel.vector_search("苹果", None).await.expect("vector search should work");
+    insert_document(pool, &id_a, "wiki/zh.md", &format!("苹果汁的制作方法介绍 {token}")).await;
+    insert_document(pool, &id_b, "wiki/zh.md", &format!("量子力学的基本理论 {token}")).await;
+    itg.es
+        .index_document(&itg.index, &id_a, "wiki/zh.md", &format!("苹果汁的制作方法介绍 {token}"), Some(&va))
+        .await
+        .expect("indexing should succeed");
+    itg.es
+        .index_document(&itg.index, &id_b, "wiki/zh.md", &format!("量子力学的基本理论 {token}"), Some(&vb))
+        .await
+        .expect("indexing should succeed");
 
+    let hits = itg
+        .funnel
+        .vector_search("苹果", None)
+        .await
+        .expect("vector search should work");
+
+    let ours: Vec<&rag_core::ScoredResult> = hits
+        .iter()
+        .filter(|h| h.id.starts_with(&format!("itg-{token}")))
+        .collect();
     assert!(
-        hits.iter().any(|h| h.id == id_a),
+        ours.iter().any(|h| h.id == id_a),
         "semantically related doc should rank, got {hits:?}"
     );
+    assert_eq!(
+        ours.first().map(|h| h.id.as_str()),
+        Some(id_a.as_str()),
+        "semantically related doc should rank above the unrelated one"
+    );
+    assert!(ours[0].matched_ann, "kNN request means hits came via ANN");
+    assert_eq!(ours[0].matched_via, vec![PreFilterStrategyKind::Elasticsearch]);
 
-    cleanup_documents(&pool, &format!("itg-{token}")).await;
+    cleanup_documents(pool, &format!("itg-{token}")).await;
     cleanup_es_doc(&itg, &id_a).await;
     cleanup_es_doc(&itg, &id_b).await;
 }
@@ -244,6 +287,11 @@ async fn hybrid_search_returns_results_and_honors_mode() {
     let pool = &itg.pool;
     let token = unique_token("hyb");
     let id = format!("itg-{token}");
+
+    let seeder = seeder_embedder();
+    let v = seeder.embed(&format!("{token} connection attempt failure")).await.expect("embed");
+    drop(seeder);
+
     insert_document(
         pool,
         &id,
@@ -252,13 +300,17 @@ async fn hybrid_search_returns_results_and_honors_mode() {
     )
     .await;
     itg.es
-        .index_document(&itg.index, &id, "wiki/errors.md", &format!("{token} connection failed"))
+        .index_document(
+            &itg.index,
+            &id,
+            "wiki/errors.md",
+            &format!("{token} connection failed"),
+            Some(&v),
+        )
         .await
         .expect("indexing should succeed");
 
-    // Default (hybrid) search returns the doc; the ES index holds it, so the
-    // pre-filter surfaces it even though the funnel also runs ANN (only one
-    // pre-filter hit -> not "confident" by the short-circuit config).
+    // Default (hybrid) search: BM25 + kNN fused by ES RRF.
     search_until_visible(&itg, &token, &id).await;
     let hits = itg
         .funnel
@@ -267,14 +319,32 @@ async fn hybrid_search_returns_results_and_honors_mode() {
         .expect("hybrid search should work");
     assert!(hits.iter().any(|h| h.id == id), "hybrid should surface {id}, got {hits:?}");
 
-    // Explicit keyword mode also works and, for a unique exact token, does
-    // not need the ANN stage at all.
+    // Explicit keyword mode: BM25-only, no ANN.
     let kw_hits = itg
         .funnel
         .search(&token, SearchMode::Keyword, SearchFilters::default(), None)
         .await
         .expect("keyword mode should work");
     assert!(kw_hits.iter().any(|h| h.id == id), "keyword mode should surface {id}");
+    assert!(
+        kw_hits.iter().all(|h| !h.matched_ann),
+        "keyword mode must not carry a kNN clause"
+    );
+
+    // Explicit semantic mode: kNN-only.
+    let sem_hits = itg
+        .funnel
+        .search(&token, SearchMode::Semantic, SearchFilters::default(), None)
+        .await
+        .expect("semantic mode should work");
+    assert!(
+        sem_hits.iter().any(|h| h.id == id),
+        "semantic mode should surface the indexed doc"
+    );
+    assert!(
+        sem_hits.iter().all(|h| h.matched_ann),
+        "semantic mode hits came via ANN"
+    );
 
     cleanup_documents(pool, "itg-hyb").await;
     cleanup_es_doc(&itg, &id).await;
@@ -295,23 +365,12 @@ async fn fetch_by_id_returns_full_content_and_not_found() {
     assert_eq!(doc.content, content);
 
     let missing = format!("itg-{token}-never-inserted");
-    let err = itg.funnel.fetch_by_id(&missing).await.expect_err("unknown id should error");
+    let err = itg
+        .funnel
+        .fetch_by_id(&missing)
+        .await
+        .expect_err("unknown id should error");
     assert!(err.to_string().contains(&missing), "error should name the id, got {err}");
 
     cleanup_documents(pool, "itg-fetch").await;
-}
-
-// Test-only helpers, private to this module.
-
-async fn insert_embedding(pool: &sqlx::PgPool, id: &str, embedding: &[f32]) {
-    let literal = format!(
-        "[{}]",
-        embedding.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(",")
-    );
-    sqlx::query("INSERT INTO chunk_embeddings (id, embedding) VALUES ($1, $2::vector)")
-        .bind(id)
-        .bind(&literal)
-        .execute(pool)
-        .await
-        .unwrap();
 }

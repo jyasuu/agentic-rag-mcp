@@ -1,54 +1,26 @@
-/// Fixed weighting coefficients for combining pre-filter and ANN scores.
-///
-/// Deliberately not per-query tunable in v1 (see opportunity list) — kept as
-/// one config struct so tuning later is a one-place change, not a hunt
-/// through funnel logic.
+/// Reciprocal Rank Fusion (RRF) configuration, passed through to the
+/// Elasticsearch hybrid request (`rank: { rrf: { window_size, rank_constant } }`).
+/// Replaces the weighted `ScoringConfig` and the hybrid short-circuit
+/// heuristic: RRF is rank-based, so there are no score-normalization
+/// coefficients to calibrate and no "is the keyword stage confident enough"
+/// decision to make — Elasticsearch owns the fused ranking.
 #[derive(Debug, Clone, Copy)]
-pub struct ScoringConfig {
-    pub w_exact: f32,
-    pub w_ann: f32,
-    pub w_metadata: f32,
+pub struct RrfConfig {
+    /// RRF window size — the number of top hits each ranked list contributes
+    /// to the fused score.
+    pub window_size: usize,
+    /// RRF rank constant (k in the standard `1 / (k + rank)` formula).
+    pub rank_constant: usize,
 }
 
-impl Default for ScoringConfig {
+impl Default for RrfConfig {
     fn default() -> Self {
-        // Starting coefficients — expected to need calibration once real
-        // query traffic is observed (see opportunity list).
+        // Elasticsearch's documented defaults; exposed via env
+        // (RAG_MCP_RRF_WINDOW_SIZE / RAG_MCP_RRF_RANK_CONSTANT) so fusion
+        // behavior can be tuned without code changes.
         Self {
-            w_exact: 0.6,
-            w_ann: 0.35,
-            w_metadata: 0.05,
-        }
-    }
-}
-
-impl ScoringConfig {
-    /// Combines a normalized exact-match score, ANN similarity, and an
-    /// optional metadata score (0.0 if absent) into a single ranking score.
-    /// Inputs are expected to already be normalized to a comparable
-    /// [0.0, 1.0] range by the caller (`RetrievalFunnel`).
-    pub fn combine(&self, exact: f32, ann: f32, metadata: f32) -> f32 {
-        self.w_exact * exact + self.w_ann * ann + self.w_metadata * metadata
-    }
-}
-
-/// Threshold config deciding when the pre-filter stage is "confident enough"
-/// to short-circuit the ANN stage in `Hybrid` mode.
-#[derive(Debug, Clone, Copy)]
-pub struct ShortCircuitConfig {
-    /// Minimum number of pre-filter hits required to consider skipping ANN.
-    pub min_hit_count: usize,
-    /// Minimum raw_score (strategy-native) a top hit must have.
-    pub min_top_score: f32,
-}
-
-impl Default for ShortCircuitConfig {
-    fn default() -> Self {
-        // Rough starting point — see opportunity list: needs calibration
-        // against real query data per pre-filter strategy.
-        Self {
-            min_hit_count: 3,
-            min_top_score: 0.5,
+            window_size: 100,
+            rank_constant: 60,
         }
     }
 }
