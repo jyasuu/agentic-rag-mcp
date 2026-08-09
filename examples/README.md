@@ -18,6 +18,7 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 
 | Path | What it is |
 | --- | --- |
+| [`architecture.svg`](architecture.svg) | One-screen diagram of the query path and the seeding/tooling scripts. |
 | [`quickstart.md`](quickstart.md) | The fast path: backends up, seeded, server running, first query answered. |
 | [`reference.md`](reference.md) | The full docs: every env var, the schema, the MCP tool contract, funnel semantics, scoring. |
 | [`env.example`](env.example) | Every supported config variable with defaults and comments. |

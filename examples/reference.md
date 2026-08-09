@@ -30,6 +30,8 @@ logic lives in the transport-independent `RetrievalFunnel`
 Elasticsearch-with-ik primary + pg_trgm fallback, pgvector ANN, BGE-M3
 embeddings (remote Ollama or local ONNX), and a Postgres content store.
 
+For the same picture as a diagram, see [`architecture.svg`](architecture.svg).
+
 ## Configuration
 
 Sourced entirely from environment variables at startup
