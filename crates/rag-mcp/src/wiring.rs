@@ -26,6 +26,7 @@ pub fn build_funnel(config: &Config, app_state: AppState) -> anyhow::Result<Arc<
         app_state.es.clone(),
         config.es_index.clone(),
         config.rrf,
+        config.fusion,
     );
 
     let backend: Box<dyn RetrievalBackend> = Box::new(FallbackRetrievalBackend::new(

@@ -6,9 +6,12 @@
 //!   - semantic — kNN on the indexed `embedding` `dense_vector`, knn-only.
 //!
 //! Hybrid mode issues both requests and fuses their ranks client-side with
-//! reciprocal rank fusion (`es_prefilter::rrf_fuse`). ES's native `rank: { rrf }`
-//! API is a paid-license feature, so the client-side fuse keeps hybrid
-//! retrieval working on the free (basic) license the `es-ik` image ships with.
+//! reciprocal rank fusion (`es_prefilter::rrf_fuse`) by default. The fusion
+//! strategy is configurable (`RAG_MCP_HYBRID_FUSION`): `normalized-mean`
+//! blends normalized scores, and `server-rrf` delegates to ES's native
+//! `rank: { rrf }` block. (Elasticsearch documents RRF as a paid-license
+//! feature, but real clusters vary; `server-rrf` surfaces whatever the engine
+//! actually returns — results or a clear error.)
 //!
 //! The index schema is owned by the seed script / CDC mirror (created here via
 //! `ensure_index`): a text `content` field analyzed by `ik_max_word`
@@ -20,6 +23,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use rag_core::RrfConfig;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -146,6 +150,36 @@ pub(crate) fn build_semantic_request(query_vector: &[f32], limit: usize) -> serd
     })
 }
 
+/// Pure request builder: server-side hybrid search — one combined request with
+/// the BM25 `query`, the kNN clause, and `rank: { rrf }` so Elasticsearch
+/// fuses the two lists natively. (Elasticsearch documents RRF as a
+/// Platinum/Enterprise feature, but real clusters vary; the caller surfaces
+/// whatever the engine actually returns.)
+pub(crate) fn build_hybrid_server_request(
+    query: &str,
+    query_vector: &[f32],
+    limit: usize,
+    analyzer: &str,
+    rrf: RrfConfig,
+) -> serde_json::Value {
+    let (k, num_candidates) = knn_params(limit);
+    json!({
+        "size": limit,
+        "query": { "match": { "content": { "query": query, "analyzer": analyzer } } },
+        "knn": {
+            "field": EMBEDDING_FIELD,
+            "query_vector": query_vector,
+            "k": k,
+            "num_candidates": num_candidates
+        },
+        "rank": { "rrf": {
+            "rank_window_size": rrf.window_size,
+            "rank_constant": rrf.rank_constant
+        } },
+        "highlight": highlight_block(),
+    })
+}
+
 #[derive(Clone)]
 pub struct EsClient {
     http: reqwest::Client,
@@ -217,6 +251,27 @@ impl EsClient {
         let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
         self.post_search(&url, &build_semantic_request(query_vector, limit))
             .await
+    }
+
+    /// `_search` against `index`: one combined BM25 + kNN request fused
+    /// server-side by `rank: { rrf }`. License-gated (Platinum/Enterprise):
+    /// a basic-license cluster rejects this request, and that error surfaces
+    /// to the caller as-is.
+    pub async fn search_hybrid_server(
+        &self,
+        index: &str,
+        query: &str,
+        query_vector: &[f32],
+        limit: usize,
+        analyzer: &str,
+        rrf: RrfConfig,
+    ) -> anyhow::Result<Vec<EsSearchHit>> {
+        let url = format!("{}/{}/_search", self.base_url.trim_end_matches('/'), index);
+        self.post_search(
+            &url,
+            &build_hybrid_server_request(query, query_vector, limit, analyzer, rrf),
+        )
+        .await
     }
 
     async fn post_search(&self, url: &str, body: &serde_json::Value) -> anyhow::Result<Vec<EsSearchHit>> {
@@ -475,5 +530,31 @@ mod tests {
         let k = req["knn"]["k"].as_u64().unwrap();
         let num_candidates = req["knn"]["num_candidates"].as_u64().unwrap();
         assert!(num_candidates >= k, "num_candidates {num_candidates} must be >= k {k}");
+    }
+
+    #[test]
+    fn hybrid_server_request_carries_query_knn_and_rank_block() {
+        let vector: Vec<f32> = (0..4).map(|i| i as f32).collect();
+        let rrf = RrfConfig {
+            window_size: 50,
+            rank_constant: 30,
+        };
+        let req = build_hybrid_server_request("连接失败", &vector, 5, IK_ANALYZER, rrf);
+
+        assert_eq!(req["size"], 5);
+        assert_eq!(req["query"]["match"]["content"]["query"], "连接失败");
+        assert_eq!(req["query"]["match"]["content"]["analyzer"], IK_ANALYZER);
+        assert_eq!(req["knn"]["field"], EMBEDDING_FIELD);
+        assert_eq!(req["knn"]["k"], 5);
+        assert_eq!(req["rank"]["rrf"]["rank_window_size"], 50);
+        assert_eq!(req["rank"]["rrf"]["rank_constant"], 30);
+        assert!(req["highlight"]["fields"]["content"]["pre_tags"][0] == "<em>");
+    }
+
+    #[test]
+    fn hybrid_server_request_uses_default_rrf_when_passed() {
+        let req = build_hybrid_server_request("x", &[0.1], 1, IK_ANALYZER, RrfConfig::default());
+        assert_eq!(req["rank"]["rrf"]["rank_window_size"], RrfConfig::default().window_size);
+        assert_eq!(req["rank"]["rrf"]["rank_constant"], RrfConfig::default().rank_constant);
     }
 }

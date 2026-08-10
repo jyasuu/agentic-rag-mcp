@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use rag_core::RrfConfig;
+use rag_core::{FusionWeights, HybridFusion, HybridFusionConfig, RrfConfig, ScoreNormalization};
 
 /// Server configuration, sourced entirely from environment variables. Kept
 /// as a plain struct (rather than threading `std::env::var` calls through
@@ -33,6 +33,10 @@ pub struct Config {
     /// (`RAG_MCP_RRF_WINDOW_SIZE` / `RAG_MCP_RRF_RANK_CONSTANT`). Optional:
     /// defaults match Elasticsearch's own RRF defaults.
     pub rrf: RrfConfig,
+    /// Hybrid fusion strategy: how keyword and kNN results are combined in
+    /// hybrid mode. Selected at startup (`RAG_MCP_HYBRID_FUSION`); the
+    /// default `client-rrf` preserves current free-license behavior.
+    pub fusion: HybridFusionConfig,
 }
 
 impl Config {
@@ -84,8 +88,66 @@ impl Config {
                 window_size: rrf_window_size,
                 rank_constant: rrf_rank_constant,
             },
+            fusion: parse_fusion_env(
+                std::env::var("RAG_MCP_HYBRID_FUSION").ok().as_deref(),
+                std::env::var("RAG_MCP_HYBRID_NORMALIZATION").ok().as_deref(),
+                std::env::var("RAG_MCP_HYBRID_KEYWORD_WEIGHT").ok().as_deref(),
+                std::env::var("RAG_MCP_HYBRID_VECTOR_WEIGHT").ok().as_deref(),
+            )?,
         })
     }
+}
+
+/// Pure parser for the hybrid fusion env vars, so the config is testable
+/// without mutating the process env. Returns the default config when every
+/// var is unset; errors on any invalid value (matching the fail-fast startup
+/// contract of the rest of `Config::from_env`).
+fn parse_fusion_env(
+    method: Option<&str>,
+    normalization: Option<&str>,
+    keyword_weight: Option<&str>,
+    vector_weight: Option<&str>,
+) -> anyhow::Result<HybridFusionConfig> {
+    let method = match method {
+        Some(s) => s
+            .parse::<HybridFusion>()
+            .map_err(|e| anyhow::anyhow!("RAG_MCP_HYBRID_FUSION: {e}"))?,
+        None => HybridFusion::default(),
+    };
+    let normalization = match normalization {
+        Some(s) => s
+            .parse::<ScoreNormalization>()
+            .map_err(|e| anyhow::anyhow!("RAG_MCP_HYBRID_NORMALIZATION: {e}"))?,
+        None => ScoreNormalization::default(),
+    };
+
+    let parse_weight = |s: &str, name: &str| -> anyhow::Result<f32> {
+        s.parse::<f32>()
+            .with_context(|| format!("{name} must be a number between 0 and 1"))
+    };
+    let kw = keyword_weight.map(|s| parse_weight(s, "RAG_MCP_HYBRID_KEYWORD_WEIGHT")).transpose()?;
+    let vec = vector_weight.map(|s| parse_weight(s, "RAG_MCP_HYBRID_VECTOR_WEIGHT")).transpose()?;
+
+    let weights = match (kw, vec) {
+        (Some(k), Some(v)) => {
+            if (k + v - 1.0).abs() > 1e-6 {
+                anyhow::bail!(
+                    "RAG_MCP_HYBRID_KEYWORD_WEIGHT + RAG_MCP_HYBRID_VECTOR_WEIGHT must sum to 1, \
+                     got {k} + {v}"
+                );
+            }
+            FusionWeights { keyword: k, vector: v }
+        }
+        (Some(k), None) => FusionWeights { keyword: k, vector: 1.0 - k },
+        (None, Some(v)) => FusionWeights { keyword: 1.0 - v, vector: v },
+        (None, None) => FusionWeights::default(),
+    };
+
+    Ok(HybridFusionConfig {
+        method,
+        normalization,
+        weights,
+    })
 }
 
 /// Reads an optional `usize` env var, returning `default` when unset and
@@ -99,4 +161,62 @@ fn parse_usize_env(name: &str, default: usize) -> anyhow::Result<usize> {
         })
         .transpose()?
         .unwrap_or(default))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rag_core::{HybridFusion, ScoreNormalization};
+
+    fn parse(
+        method: Option<&str>,
+        norm: Option<&str>,
+        kw: Option<&str>,
+        vec: Option<&str>,
+    ) -> anyhow::Result<HybridFusionConfig> {
+        parse_fusion_env(method, norm, kw, vec)
+    }
+
+    #[test]
+    fn fusion_defaults_to_client_rrf_equal_weights_min_max() {
+        let cfg = parse(None, None, None, None).unwrap();
+        assert_eq!(cfg.method, HybridFusion::ClientRrf);
+        assert_eq!(cfg.normalization, ScoreNormalization::MinMax);
+        assert_eq!(cfg.weights.keyword, 0.5);
+        assert_eq!(cfg.weights.vector, 0.5);
+    }
+
+    #[test]
+    fn fusion_method_and_normalization_parse() {
+        let cfg = parse(Some("server-rrf"), Some("l2"), None, None).unwrap();
+        assert_eq!(cfg.method, HybridFusion::ServerRrf);
+        assert_eq!(cfg.normalization, ScoreNormalization::L2);
+    }
+
+    #[test]
+    fn single_weight_fills_the_other_to_sum_one() {
+        let cfg = parse(Some("normalized-mean"), None, Some("0.3"), None).unwrap();
+        assert!((cfg.weights.keyword - 0.3).abs() < 1e-6);
+        assert!((cfg.weights.vector - 0.7).abs() < 1e-6);
+
+        let cfg = parse(Some("normalized-mean"), None, None, Some("0.8")).unwrap();
+        assert!((cfg.weights.keyword - 0.2).abs() < 1e-6);
+        assert!((cfg.weights.vector - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn explicit_pair_must_sum_to_one() {
+        assert!(parse(Some("normalized-mean"), None, Some("0.5"), Some("0.5")).is_ok());
+        assert!(
+            parse(Some("normalized-mean"), None, Some("0.3"), Some("0.8")).is_err(),
+            "weights summing away from 1 must be rejected"
+        );
+    }
+
+    #[test]
+    fn invalid_fusion_values_fail_startup() {
+        assert!(parse(Some("rank-rrf"), None, None, None).is_err());
+        assert!(parse(Some("normalized-mean"), Some("zscore"), None, None).is_err());
+        assert!(parse(Some("normalized-mean"), None, Some("abc"), None).is_err());
+    }
 }

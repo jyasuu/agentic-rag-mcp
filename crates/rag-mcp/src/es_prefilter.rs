@@ -21,8 +21,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use rag_core::{
-    PreFilterStrategyKind, RagError, RagResult, RankedHit, RetrievalBackend, RetrievalMode,
-    RrfConfig,
+    HybridFusion, HybridFusionConfig, PreFilterStrategyKind, RagError, RagResult, RankedHit,
+    RetrievalBackend, RetrievalMode, RrfConfig, ScoreNormalization,
 };
 
 use crate::es::{EsClient, EsSearchHit, IK_ANALYZER};
@@ -34,14 +34,21 @@ pub struct EsRetrievalBackend {
     client: EsClient,
     index: String,
     rrf: RrfConfig,
+    fusion: HybridFusionConfig,
 }
 
 impl EsRetrievalBackend {
-    pub fn new(client: EsClient, index: impl Into<String>, rrf: RrfConfig) -> Self {
+    pub fn new(
+        client: EsClient,
+        index: impl Into<String>,
+        rrf: RrfConfig,
+        fusion: HybridFusionConfig,
+    ) -> Self {
         Self {
             client,
             index: index.into(),
             rrf,
+            fusion,
         }
     }
 }
@@ -149,6 +156,112 @@ fn rrf_fuse(
     results
 }
 
+/// Client-side score-based fusion of the BM25 and kNN result lists. Each
+/// list's raw scores are normalized independently (min-max over the returned
+/// list, or L2), then each hit's fused score is the weighted mean of its
+/// normalized scores: `weights.keyword * norm_keyword + weights.vector *
+/// norm_vector`. Unlike `rrf_fuse`, score *magnitude* matters (a much
+/// stronger BM25 match can outrank a middling one) and the per-list weights
+/// let the operator emphasize the signal they trust more. `matched_ann` stays
+/// per-hit accurate and snippet behavior matches `rrf_fuse` (keyword
+/// highlight wins, truncated fallback otherwise). Pure so the fusion math is
+/// unit-testable without a cluster.
+fn score_fuse(
+    keyword: Vec<EsSearchHit>,
+    semantic: Vec<EsSearchHit>,
+    limit: usize,
+    cfg: HybridFusionConfig,
+) -> Vec<RankedHit> {
+    struct Fused {
+        source: String,
+        score: f32,
+        snippet: String,
+        content: Option<String>,
+        matched_ann: bool,
+    }
+
+    let mut by_id: HashMap<String, Fused> = HashMap::new();
+
+    for (hits, matched_ann, weight) in [
+        (&keyword, false, cfg.weights.keyword),
+        (&semantic, true, cfg.weights.vector),
+    ] {
+        let norm = normalize_scores(hits, cfg.normalization);
+        for (h, n) in hits.iter().zip(norm) {
+            let entry = by_id.entry(h.id.clone()).or_insert_with(|| Fused {
+                source: h.source.clone(),
+                score: 0.0,
+                snippet: String::new(),
+                content: h.content.clone(),
+                matched_ann,
+            });
+            entry.score += weight * n;
+            entry.matched_ann = entry.matched_ann || matched_ann;
+            if entry.snippet.is_empty() {
+                entry.snippet = h.highlight.first().cloned().unwrap_or_default();
+            }
+        }
+    }
+
+    let mut results: Vec<RankedHit> = by_id
+        .into_iter()
+        .map(|(id, mut f)| {
+            if f.snippet.is_empty() {
+                f.snippet = f
+                    .content
+                    .as_deref()
+                    .map(|c| truncate(c, SNIPPET_FALLBACK_LEN))
+                    .unwrap_or_default();
+            }
+            RankedHit {
+                id,
+                source: f.source,
+                score: f.score,
+                snippet: f.snippet,
+                which_strategy: PreFilterStrategyKind::Elasticsearch,
+                matched_ann: f.matched_ann,
+            }
+        })
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    results.truncate(limit);
+    results
+}
+
+/// Normalizes a list of raw scores per the chosen method. Empty input
+/// produces an empty output; a zero-norm L2 list (all-zero scores) and a
+/// min-max list with no range both avoid divide-by-zero by falling back to a
+/// neutral value rather than NaN.
+fn normalize_scores(hits: &[EsSearchHit], norm: ScoreNormalization) -> Vec<f32> {
+    let scores: Vec<f32> = hits.iter().map(|h| h.score.unwrap_or(0.0)).collect();
+    match norm {
+        ScoreNormalization::MinMax => {
+            let min = scores.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let range = max - min;
+            if range <= f32::EPSILON {
+                vec![1.0; scores.len()]
+            } else {
+                scores.iter().map(|s| (s - min) / range).collect()
+            }
+        }
+        ScoreNormalization::L2 => {
+            let l2: f32 = scores.iter().map(|s| s * s).sum::<f32>().sqrt();
+            if l2 <= f32::EPSILON {
+                vec![0.0; scores.len()]
+            } else {
+                scores.iter().map(|s| s / l2).collect()
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl RetrievalBackend for EsRetrievalBackend {
     async fn search(
@@ -188,17 +301,52 @@ impl RetrievalBackend for EsRetrievalBackend {
                 let vector = query_vector.ok_or_else(|| {
                     RagError::Ann("hybrid mode requires a query vector".into())
                 })?;
-                let keyword_hits = self
-                    .client
-                    .search_keyword(&self.index, query, limit, IK_ANALYZER)
-                    .await
-                    .map_err(|e| RagError::Ann(format!("Elasticsearch keyword search failed: {e}")))?;
-                let semantic_hits = self
-                    .client
-                    .search_semantic(&self.index, vector, limit)
-                    .await
-                    .map_err(|e| RagError::Ann(format!("Elasticsearch kNN search failed: {e}")))?;
-                Ok(rrf_fuse(keyword_hits, semantic_hits, limit, self.rrf))
+                match self.fusion.method {
+                    HybridFusion::ClientRrf => {
+                        let keyword_hits = self
+                            .client
+                            .search_keyword(&self.index, query, limit, IK_ANALYZER)
+                            .await
+                            .map_err(|e| RagError::Ann(format!("Elasticsearch keyword search failed: {e}")))?;
+                        let semantic_hits = self
+                            .client
+                            .search_semantic(&self.index, vector, limit)
+                            .await
+                            .map_err(|e| RagError::Ann(format!("Elasticsearch kNN search failed: {e}")))?;
+                        Ok(rrf_fuse(keyword_hits, semantic_hits, limit, self.rrf))
+                    }
+                    HybridFusion::NormalizedMean => {
+                        let keyword_hits = self
+                            .client
+                            .search_keyword(&self.index, query, limit, IK_ANALYZER)
+                            .await
+                            .map_err(|e| RagError::Ann(format!("Elasticsearch keyword search failed: {e}")))?;
+                        let semantic_hits = self
+                            .client
+                            .search_semantic(&self.index, vector, limit)
+                            .await
+                            .map_err(|e| RagError::Ann(format!("Elasticsearch kNN search failed: {e}")))?;
+                        Ok(score_fuse(keyword_hits, semantic_hits, limit, self.fusion))
+                    }
+                    HybridFusion::ServerRrf => {
+                        let hits = self
+                            .client
+                            .search_hybrid_server(
+                                &self.index,
+                                query,
+                                vector,
+                                limit,
+                                IK_ANALYZER,
+                                self.rrf,
+                            )
+                            .await
+                            .map_err(|e| RagError::Ann(format!("Elasticsearch hybrid search failed: {e}")))?;
+                        // ES RRF responses don't expose per-hit clause matches,
+                        // so `matched_ann` is request-level: the request carried
+                        // a kNN clause.
+                        Ok(map_hits(hits, true))
+                    }
+                }
             }
         }
     }
@@ -208,6 +356,8 @@ impl RetrievalBackend for EsRetrievalBackend {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    use rag_core::FusionWeights;
 
     use crate::es::IK_ANALYZER;
 
@@ -219,6 +369,143 @@ mod tests {
             content: Some(content.into()),
             highlight: highlights.into_iter().map(String::from).collect(),
         }
+    }
+
+    /// `es_hit` with an explicit raw score, for normalization tests.
+    fn es_hit_scored(id: &str, score: f32, content: &str) -> EsSearchHit {
+        EsSearchHit {
+            id: id.into(),
+            score: Some(score),
+            source: "wiki/zh.md".into(),
+            content: Some(content.into()),
+            highlight: vec![],
+        }
+    }
+
+    #[test]
+    fn score_fuse_minmax_normalizes_and_combines_with_weights() {
+        // keyword scores: a=100, b=10  -> minmax: a=1.0, b=0.0
+        // vector  scores: a=50,  c=40  -> minmax: a=1.0, c=0.0
+        // weights 0.5/0.5:
+        //   a = 0.5*1.0 + 0.5*1.0 = 1.0
+        //   b = 0.5*0.0 = 0.0
+        //   c = 0.5*0.0 = 0.0
+        // tie b/c broken by id asc -> b, c.
+        let keyword = vec![
+            es_hit_scored("a", 100.0, "alpha"),
+            es_hit_scored("b", 10.0, "beta"),
+        ];
+        let semantic = vec![
+            es_hit_scored("a", 50.0, "alpha"),
+            es_hit_scored("c", 40.0, "gamma"),
+        ];
+        let cfg = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::MinMax,
+            weights: FusionWeights {
+                keyword: 0.5,
+                vector: 0.5,
+            },
+        };
+
+        let fused = score_fuse(keyword, semantic, 10, cfg);
+
+        assert_eq!(
+            fused.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!((fused[0].score - 1.0).abs() < 1e-6, "in both lists at max -> 1.0");
+        assert!((fused[1].score - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_fuse_minmax_uses_keyword_highlight_and_flags_ann() {
+        let keyword = vec![
+            es_hit_scored("a", 100.0, "alpha"),
+        ];
+        let semantic = vec![
+            es_hit_scored("a", 50.0, "alpha"),
+            es_hit_scored("b", 40.0, "beta"),
+        ];
+        let cfg = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::MinMax,
+            weights: FusionWeights { keyword: 0.7, vector: 0.3 },
+        };
+        // a has no keyword highlight, so it falls back to a truncated snippet;
+        // b is in the kNN list -> matched_ann.
+        let fused = score_fuse(keyword, semantic, 10, cfg);
+        let by_id = |id: &str| fused.iter().find(|h| h.id == id).unwrap();
+        assert!(by_id("b").matched_ann, "kNN-list presence is an ANN match");
+        assert!(by_id("b").snippet.starts_with("beta"), "ANN-only snippet truncation fallback");
+    }
+
+    #[test]
+    fn score_fuse_l2_normalizes_by_list_norm() {
+        // keyword: a=3, b=4 -> l2 = 5 -> a=0.6, b=0.8
+        // vector:  a=6, c=8 -> l2 = 10 -> a=0.6, c=0.8
+        // weights 0.5/0.5:
+        //   a = 0.5*0.6 + 0.5*0.6 = 0.6
+        //   b = 0.5*0.8 = 0.4
+        //   c = 0.5*0.8 = 0.4 -> tie broken by id -> b, c
+        let keyword = vec![
+            es_hit_scored("a", 3.0, "alpha"),
+            es_hit_scored("b", 4.0, "beta"),
+        ];
+        let semantic = vec![
+            es_hit_scored("a", 6.0, "alpha"),
+            es_hit_scored("c", 8.0, "gamma"),
+        ];
+        let cfg = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::L2,
+            weights: FusionWeights { keyword: 0.5, vector: 0.5 },
+        };
+
+        let fused = score_fuse(keyword, semantic, 10, cfg);
+        assert_eq!(
+            fused.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert!((fused[0].score - 0.6).abs() < 1e-6);
+        assert!((fused[1].score - 0.4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn score_fuse_handles_empty_and_zero_norm_lists() {
+        let cfg = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::MinMax,
+            weights: FusionWeights { keyword: 0.5, vector: 0.5 },
+        };
+        // Empty semantic list: keyword-only hits survive with weight-scaled
+        // normalized scores.
+        let keyword = vec![es_hit_scored("a", 42.0, "alpha")];
+        let fused = score_fuse(keyword, vec![], 10, cfg);
+        assert_eq!(fused.len(), 1);
+        assert!((fused[0].score - 0.5).abs() < 1e-6, "single-hit list normalizes to 1.0, halved by weight");
+
+        // Zero-norm list: constant score (max == min) is not a divide-by-zero;
+        // both hits get the same normalized score and rank by id.
+        let flat_keyword = vec![
+            es_hit_scored("a", 1.0, "alpha"),
+            es_hit_scored("b", 1.0, "beta"),
+        ];
+        let fused = score_fuse(flat_keyword, vec![], 10, cfg);
+        assert_eq!(fused.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn score_fuse_respects_limit_and_keeps_positive_scores() {
+        let cfg = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::MinMax,
+            weights: FusionWeights { keyword: 0.5, vector: 0.5 },
+        };
+        let keyword: Vec<EsSearchHit> = (0..5).map(|i| es_hit_scored(&format!("k{i}"), i as f32 + 1.0, "k")).collect();
+        let fused = score_fuse(keyword, vec![], 2, cfg);
+        assert_eq!(fused.len(), 2, "limit truncates after fusion");
+        assert!(fused.iter().all(|h| h.score >= 0.0));
     }
 
     #[test]
@@ -417,7 +704,15 @@ mod tests {
     }
 
     fn backend(client: EsClient, index: String) -> EsRetrievalBackend {
-        EsRetrievalBackend::new(client, index, RrfConfig::default())
+        EsRetrievalBackend::new(client, index, RrfConfig::default(), HybridFusionConfig::default())
+    }
+
+    fn backend_with_fusion(
+        client: EsClient,
+        index: String,
+        fusion: HybridFusionConfig,
+    ) -> EsRetrievalBackend {
+        EsRetrievalBackend::new(client, index, RrfConfig::default(), fusion)
     }
 
     /// ES is near-real-time: poll until the expected id is visible (or give
@@ -633,6 +928,105 @@ mod tests {
             hy2.snippet.starts_with("今天"),
             "ANN-only hits fall back to a truncated content snippet"
         );
+
+        cleanup_index(&client, &index).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_normalized_mean_weights_keyword_over_vector() {
+        let Some(client) = test_client().await else {
+            eprintln!("skipping: RAG_MCP_ELASTICSEARCH_URL not set");
+            return;
+        };
+        let index = unique_index(&client).await;
+        let va = vec(1, 1024);
+        let vb = vec(2, 1024);
+        // Both docs appear in both lists (each is both a strong keyword and a
+        // near kNN match); the one with the stronger BM25 score must rank
+        // first under the weighted normalized mean.
+        client
+            .index_document(&index, "nm-1", "wiki/zh.md", "系统发生连接失败错误码需要重试 连接失败 连接失败", Some(&va))
+            .await
+            .expect("indexing should succeed");
+        client
+            .index_document(&index, "nm-2", "wiki/zh.md", "系统发生连接失败错误码 连接失败", Some(&vb))
+            .await
+            .expect("indexing should succeed");
+
+        let fusion = HybridFusionConfig {
+            method: HybridFusion::NormalizedMean,
+            normalization: ScoreNormalization::MinMax,
+            weights: FusionWeights {
+                keyword: 0.7,
+                vector: 0.3,
+            },
+        };
+        let backend = backend_with_fusion(client.clone(), index.clone(), fusion);
+
+        let mut hits = Vec::new();
+        for _ in 0..20 {
+            hits = backend
+                .search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10)
+                .await
+                .expect("hybrid search should succeed");
+            if hits.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        assert_eq!(hits.len(), 2, "both docs should surface under weighted-mean fusion");
+        assert_eq!(hits[0].id, "nm-1", "stronger keyword match wins when keyword weight dominates");
+        assert!(
+            hits[0].snippet.contains("<em>连接</em>"),
+            "keyword highlight survives normalized-mean fusion"
+        );
+        assert!(
+            hits.iter().all(|h| h.score >= 0.0),
+            "normalized-mean fused scores must be non-negative"
+        );
+
+        cleanup_index(&client, &index).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_search_server_rrf_returns_results_or_clean_license_error() {
+        let Some(client) = test_client().await else {
+            eprintln!("skipping: RAG_MCP_ELASTICSEARCH_URL not set");
+            return;
+        };
+        let index = unique_index(&client).await;
+        let va = vec(1, 1024);
+        client
+            .index_document(&index, "sr-1", "wiki/zh.md", "系统发生连接失败错误码需要重试", Some(&va))
+            .await
+            .expect("indexing should succeed");
+
+        let fusion = HybridFusionConfig {
+            method: HybridFusion::ServerRrf,
+            ..HybridFusionConfig::default()
+        };
+        let backend = backend_with_fusion(client.clone(), index.clone(), fusion);
+
+        // The license gate is engine-side: a licensed cluster returns fused
+        // results; a basic-license cluster rejects the request, and that must
+        // surface as a clear `Ann` error naming the failure rather than
+        // silently degrading to empty results.
+        match backend.search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10).await {
+            Ok(hits) => {
+                assert!(
+                    hits.iter().any(|h| h.id == "sr-1"),
+                    "server-side RRF should surface the matching doc, got {hits:?}"
+                );
+            }
+            Err(RagError::Ann(msg)) => {
+                assert!(
+                    msg.contains("hybrid search failed"),
+                    "license rejection must surface as a clear Ann error, got {msg:?}"
+                );
+            }
+            Err(other) => panic!("server-rrf must surface Ok or RagError::Ann, got {other:?}"),
+        }
 
         cleanup_index(&client, &index).await;
     }

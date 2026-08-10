@@ -23,7 +23,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rag_core::{Embedder, PreFilterStrategyKind, RetrievalFunnel, SearchFilters, SearchMode};
+use rag_core::{
+    Embedder, HybridFusion, HybridFusionConfig, PreFilterStrategyKind, RetrievalFunnel,
+    SearchFilters, SearchMode,
+};
 
 use crate::config::Config;
 use crate::embedder::{BgeM3Embedder, OllamaEmbedder};
@@ -41,6 +44,13 @@ struct Integration {
 }
 
 async fn integration() -> Option<Arc<Integration>> {
+    integration_with(rag_core::HybridFusionConfig::default()).await
+}
+
+/// Like [`integration`], but builds the funnel with a specific hybrid fusion
+/// strategy so tests can exercise each `RAG_MCP_HYBRID_FUSION` value against
+/// the real backends.
+async fn integration_with(fusion: rag_core::HybridFusionConfig) -> Option<Arc<Integration>> {
     let (pool, es_url, embed) = match (
         test_pool().await,
         std::env::var("RAG_MCP_ELASTICSEARCH_URL").ok(),
@@ -78,6 +88,7 @@ async fn integration() -> Option<Arc<Integration>> {
         ollama_model: embed.ollama_model.clone(),
         connect_timeout: Duration::from_secs(5),
         rrf: rag_core::RrfConfig::default(),
+        fusion,
     };
     let funnel = build_funnel(
         &config,
@@ -252,6 +263,12 @@ async fn vector_search_returns_semantic_results_end_to_end() {
         .await
         .expect("indexing should succeed");
 
+    // ES is near-real-time: a freshly indexed doc is not queryable until the
+    // next refresh. Poll keyword visibility first, like the other integration
+    // tests, so the kNN query below sees both docs.
+    search_until_visible(&itg, &token, &id_a).await;
+    search_until_visible(&itg, &token, &id_b).await;
+
     let hits = itg
         .funnel
         .vector_search("苹果", None)
@@ -347,6 +364,124 @@ async fn hybrid_search_returns_results_and_honors_mode() {
     );
 
     cleanup_documents(pool, "itg-hyb").await;
+    cleanup_es_doc(&itg, &id).await;
+}
+
+#[tokio::test]
+async fn hybrid_normalized_mean_fusion_surfaces_doc_via_weighted_scores() {
+    let fusion = HybridFusionConfig {
+        method: HybridFusion::NormalizedMean,
+        normalization: rag_core::ScoreNormalization::MinMax,
+        weights: rag_core::FusionWeights {
+            keyword: 0.7,
+            vector: 0.3,
+        },
+    };
+    let Some(itg) = integration_with(fusion).await else {
+        return;
+    };
+    let pool = &itg.pool;
+    let token = unique_token("nmean");
+    let id = format!("itg-{token}");
+
+    let seeder = seeder_embedder();
+    let v = seeder.embed(&format!("{token} connection attempt failure")).await.expect("embed");
+    drop(seeder);
+
+    insert_document(
+        pool,
+        &id,
+        "wiki/errors.md",
+        &format!("{token} is raised when a connection attempt fails."),
+    )
+    .await;
+    itg.es
+        .index_document(
+            &itg.index,
+            &id,
+            "wiki/errors.md",
+            &format!("{token} connection failed"),
+            Some(&v),
+        )
+        .await
+        .expect("indexing should succeed");
+
+    search_until_visible(&itg, &token, &id).await;
+    let hits = itg
+        .funnel
+        .search(&token, SearchMode::Hybrid, SearchFilters::default(), None)
+        .await
+        .expect("normalized-mean hybrid search should work");
+    let hit = hits.iter().find(|h| h.id == id).expect("fusion should surface {id}");
+    assert!(
+        hit.score >= 0.0,
+        "weighted normalized-mean scores must stay non-negative"
+    );
+    assert!(hit.matched_ann, "hybrid hits arrive via ANN");
+
+    cleanup_documents(pool, &format!("itg-{token}")).await;
+    cleanup_es_doc(&itg, &id).await;
+}
+
+#[tokio::test]
+async fn hybrid_server_rrf_fusion_surfaces_doc_or_clear_error() {
+    let fusion = HybridFusionConfig {
+        method: HybridFusion::ServerRrf,
+        ..HybridFusionConfig::default()
+    };
+    let Some(itg) = integration_with(fusion).await else {
+        return;
+    };
+    let pool = &itg.pool;
+    let token = unique_token("srrf");
+    let id = format!("itg-{token}");
+
+    let seeder = seeder_embedder();
+    let v = seeder.embed(&format!("{token} connection attempt failure")).await.expect("embed");
+    drop(seeder);
+
+    insert_document(
+        pool,
+        &id,
+        "wiki/errors.md",
+        &format!("{token} is raised when a connection attempt fails."),
+    )
+    .await;
+    itg.es
+        .index_document(
+            &itg.index,
+            &id,
+            "wiki/errors.md",
+            &format!("{token} connection failed"),
+            Some(&v),
+        )
+        .await
+        .expect("indexing should succeed");
+
+    search_until_visible(&itg, &token, &id).await;
+    // Server-side RRF is engine-gated: a licensed cluster returns fused
+    // results, a basic-license cluster rejects the request. Both are
+    // legitimate outcomes the funnel must not mask.
+    match itg
+        .funnel
+        .search(&token, SearchMode::Hybrid, SearchFilters::default(), None)
+        .await
+    {
+        Ok(hits) => {
+            assert!(
+                hits.iter().any(|h| h.id == id),
+                "server-rrf should surface {id}, got {hits:?}"
+            );
+        }
+        Err(e) => {
+            assert!(
+                e.to_string().contains("hybrid search failed"),
+                "engine rejection must surface as a clear hybrid error, got {e}"
+            );
+        }
+    }
+
+    cleanup_documents(pool, &format!("itg-{token}")).await;
     cleanup_es_doc(&itg, &id).await;
 }
 

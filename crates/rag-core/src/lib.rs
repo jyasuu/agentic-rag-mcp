@@ -4,7 +4,9 @@ pub mod traits;
 pub mod types;
 
 pub use funnel::RetrievalFunnel;
-pub use scoring::RrfConfig;
+pub use scoring::{
+    FusionWeights, HybridFusion, HybridFusionConfig, RrfConfig, ScoreNormalization,
+};
 pub use traits::{ContentStore, Embedder, RetrievalBackend};
 pub use types::{
     Document, PreFilterStrategyKind, RagError, RagResult, RankedHit, RetrievalMode, ScoredResult,
