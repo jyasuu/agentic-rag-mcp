@@ -17,7 +17,7 @@ pub use types::{
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct FakeEmbedder;
     #[async_trait]
@@ -45,9 +45,12 @@ mod tests {
     /// mapping testable without any real Postgres/ES/ort dependency.
     #[derive(Clone)]
     struct RecordingBackend {
-        calls: Arc<std::sync::Mutex<Vec<(RetrievalMode, Option<String>, Option<usize>)>>>,
+        calls: Arc<Mutex<Vec<DispatchCall>>>,
         hits: Vec<RankedHit>,
     }
+    /// One recorded backend dispatch: the mode plus which optional
+    /// keyword/vector payload (if any) the funnel passed through.
+    type DispatchCall = (RetrievalMode, Option<String>, Option<usize>);
     #[async_trait]
     impl RetrievalBackend for RecordingBackend {
         async fn search(

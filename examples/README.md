@@ -11,7 +11,8 @@ Everything here assumes the same layout as `SPEC.md` and `migrations/` in
 
 - Elasticsearch is the sole retrieval engine: BM25 keyword search (with the
   `analysis-ik` plugin for Chinese), kNN semantic search on the `embedding`
-  `dense_vector` field, and hybrid BM25+kNN fused client-side with RRF.
+  `dense_vector` field, and hybrid BM25+kNN fused per the configurable strategy
+  (client RRF, a normalized weighted mean, or server-side RRF).
 - Postgres holds the corpus (the content store behind `fetch_by_id`) and the
   tsvector keyword fallback, used when ES errors or returns no hits.
 - The server runs a thin dispatch funnel: one retrieval backend, the BGE-M3

@@ -164,6 +164,12 @@ async fn cleanup_es_doc(itg: &Integration, id: &str) {
     let _ = itg.es.delete_document(&itg.index, id).await;
 }
 
+/// Drops the whole uniquely-named test index, so `rag-itg-*` indexes don't
+/// accumulate in the shared cluster across runs. Called after every test.
+async fn cleanup_index(itg: &Integration) {
+    let _ = itg.es.delete_index(&itg.index).await;
+}
+
 #[tokio::test]
 async fn keyword_search_returns_tsvector_hits_end_to_end() {
     let Some(itg) = integration().await else {
@@ -192,6 +198,7 @@ async fn keyword_search_returns_tsvector_hits_end_to_end() {
 
     cleanup_documents(&itg.pool, "itg-kw").await;
     cleanup_es_doc(&itg, &id).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -232,6 +239,7 @@ async fn keyword_search_returns_elasticsearch_hits_for_chinese_end_to_end() {
     );
 
     cleanup_es_doc(&itg, &id).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -265,15 +273,24 @@ async fn vector_search_returns_semantic_results_end_to_end() {
 
     // ES is near-real-time: a freshly indexed doc is not queryable until the
     // next refresh. Poll keyword visibility first, like the other integration
-    // tests, so the kNN query below sees both docs.
+    // tests, then poll the kNN query itself (the vector index can lag the
+    // keyword segments under concurrent load), so the ranking assertions
+    // below run against a stable index.
     search_until_visible(&itg, &token, &id_a).await;
     search_until_visible(&itg, &token, &id_b).await;
 
-    let hits = itg
-        .funnel
-        .vector_search("苹果", None)
-        .await
-        .expect("vector search should work");
+    let mut hits = Vec::new();
+    for _ in 0..20 {
+        hits = itg
+            .funnel
+            .vector_search("苹果", None)
+            .await
+            .expect("vector search should work");
+        if hits.iter().any(|h| h.id.starts_with(&format!("itg-{token}"))) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 
     let ours: Vec<&rag_core::ScoredResult> = hits
         .iter()
@@ -294,6 +311,7 @@ async fn vector_search_returns_semantic_results_end_to_end() {
     cleanup_documents(pool, &format!("itg-{token}")).await;
     cleanup_es_doc(&itg, &id_a).await;
     cleanup_es_doc(&itg, &id_b).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -365,6 +383,7 @@ async fn hybrid_search_returns_results_and_honors_mode() {
 
     cleanup_documents(pool, "itg-hyb").await;
     cleanup_es_doc(&itg, &id).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -421,6 +440,7 @@ async fn hybrid_normalized_mean_fusion_surfaces_doc_via_weighted_scores() {
 
     cleanup_documents(pool, &format!("itg-{token}")).await;
     cleanup_es_doc(&itg, &id).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -483,6 +503,7 @@ async fn hybrid_server_rrf_fusion_surfaces_doc_or_clear_error() {
 
     cleanup_documents(pool, &format!("itg-{token}")).await;
     cleanup_es_doc(&itg, &id).await;
+    cleanup_index(&itg).await;
 }
 
 #[tokio::test]
@@ -508,4 +529,5 @@ async fn fetch_by_id_returns_full_content_and_not_found() {
     assert!(err.to_string().contains(&missing), "error should name the id, got {err}");
 
     cleanup_documents(pool, "itg-fetch").await;
+    cleanup_index(&itg).await;
 }

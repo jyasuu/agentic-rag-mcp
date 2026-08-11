@@ -1,6 +1,6 @@
 # TODO
 
-## Hybrid fusion strategies (in progress)
+## Hybrid fusion strategies (done)
 
 Configurable `RAG_MCP_HYBRID_FUSION` (`client-rrf` | `normalized-mean` | `server-rrf`).
 
@@ -12,11 +12,11 @@ Configurable `RAG_MCP_HYBRID_FUSION` (`client-rrf` | `normalized-mean` | `server
 - [x] Real-ES tests per strategy in `es_prefilter.rs`
 - [x] Integration tests for `normalized-mean` and `server-rrf`
 - [x] Unit tests for `score_fuse`, request builder, config parsing
-- [ ] Update module docs + reference docs (reference.md, examples)
-- [ ] Full suite green (note: `integration::vector_search_returns_semantic_results_end_to_end` flaked on ES NRT visibility — poll was added; verify on a stable run)
-- [ ] `/code-review` then commit
+- [x] Update module docs + reference docs (reference.md, examples, SPEC.md)
+- [x] Full suite green (note: `integration::vector_search_returns_semantic_results_end_to_end` flaked on ES NRT visibility — poll was added; verify on a stable run)
+- [x] `/code-review` then commit
 
 ## Follow-ups noticed while working
 
-- [ ] `testutil.rs:101 unique_term()` is dead code (unused warning) — remove or use
-- [ ] Stale `rag-itg-*` indexes accumulate in the shared ES cluster across test runs — consider a cleanup step or `?refresh=true` on `index_document`
+- [x] `testutil.rs:101 unique_term()` is dead code (unused warning) — remove or use
+- [x] Stale `rag-itg-*` indexes accumulate in the shared ES cluster across test runs — consider a cleanup step or `?refresh=true` on `index_document`

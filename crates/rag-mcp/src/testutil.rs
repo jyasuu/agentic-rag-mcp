@@ -1,9 +1,9 @@
-//! Test-only helpers shared by the backend integration tests (trigram,
-//! pgvector ANN, content store, ES-backed strategies). Mirrors the pattern
-//! established by the `tsvector` tests (SPEC.md: "each [strategy] against a
-//! minimal fixture dataset"): real-Postgres tests run against
-//! `RAG_MCP_DATABASE_URL` and are skipped -- not failed -- when it isn't set,
-//! so `cargo test` stays green without Postgres.
+//! Test-only helpers shared by the backend integration tests (tsvector,
+//! content store, ES-backed strategies, and the end-to-end wiring suite).
+//! Mirrors the pattern established by the `tsvector` tests (SPEC.md: "each
+//! [strategy] against a minimal fixture dataset"): real-Postgres tests run
+//! against `RAG_MCP_DATABASE_URL` and are skipped -- not failed -- when it
+//! isn't set, so `cargo test` stays green without Postgres.
 //!
 //! The `migrations/*.sql` files are applied idempotently so tests can create
 //! whatever schema they need (extensions, tables, indexes) on a disposable
@@ -91,23 +91,6 @@ pub async fn apply_schema(pool: &PgPool) {
 pub fn unique_token(test_name: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("{test_name}{}{n}", std::process::id())
-}
-
-/// A random-looking, prefix-free token for fuzzy-matcher (pg_trgm) fixtures.
-/// Unlike `unique_token`, it shares no common prefix between tests: trigram
-/// strategies return *similar* rows, so tokens that share a prefix (e.g. all
-/// `trgm-…` ids) fuzzy-match each other's rows when tests run concurrently.
-/// Hex-only so no character acts as a trigram boundary.
-pub fn unique_term() -> String {
-    let mut buf = [0u8; 8];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
-        .expect("test should be able to read /dev/urandom");
-    let mut s = String::with_capacity(16);
-    for b in buf {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
 }
 
 pub async fn insert_document(pool: &PgPool, id: &str, source: &str, content: &str) {

@@ -17,19 +17,20 @@ MCP client ──POST /mcp (Bearer auth)──> rag-mcp server
                                            ▼
                                   RetrievalFunnel (rag-core, transport-free)
                                            │  maps mode → one request shape
-                       ┌───────────────────┼──────────────────────┬──────────┐
-                       ▼                   ▼                      ▼          ▼
-              Elasticsearch          Ollama / ONNX        Postgres        Postgres
-              BM25 · kNN · RRF       embedder (BGE-M3)    content store   tsvector
-              (sole retrieval)       semantic/hybrid      fetch_by_id     keyword
-              hybrid fused           query vectors                        fallback
-              client-side RRF                                              (ES err/empty)
+                        ┌───────────────────┼──────────────────────┬──────────┐
+                        ▼                   ▼                      ▼          ▼
+               Elasticsearch          Ollama / ONNX        Postgres        Postgres
+               BM25 · kNN · RRF       embedder (BGE-M3)    content store   tsvector
+               (sole retrieval)      semantic/hybrid      fetch_by_id     keyword
+               hybrid fused           query vectors                        fallback
+               (RRF / weighted mean)                                       (ES err/empty)
 ```
 
 The server (`crates/rag-mcp`) is a thin `rmcp` + `axum` layer. All retrieval
 logic lives in the transport-independent `RetrievalFunnel` (`crates/rag-core`).
 The funnel composes a single `RetrievalBackend` — Elasticsearch owns ranking
-(BM25 / kNN / RRF) — plus the BGE-M3 embedder (remote Ollama or local ONNX)
+(BM25 / kNN / RRF, or a client-side RRF / weighted-mean fusion of BM25 and
+kNN) — plus the BGE-M3 embedder (remote Ollama or local ONNX)
 and a Postgres content store. Postgres also hosts the tsvector keyword
 fallback, used only when Elasticsearch errors or returns no keyword hits.
 
@@ -51,6 +52,10 @@ clear error.
 | `RAG_MCP_CONNECT_TIMEOUT_SECS` | no | `5` | Connect/health-check timeout for PG and ES, in seconds. |
 | `RAG_MCP_RRF_WINDOW_SIZE` | no | `100` | RRF `window_size`: how many hits per list each fused request contributes. |
 | `RAG_MCP_RRF_RANK_CONSTANT` | no | `60` | RRF `rank_constant` (the `k` in `1/(k + rank + 1)`). |
+| `RAG_MCP_HYBRID_FUSION` | no | `client-rrf` | How hybrid mode combines the keyword and kNN lists: `client-rrf` \| `normalized-mean` \| `server-rrf` (see [Fusion (hybrid mode)](#fusion-hybrid-mode)). |
+| `RAG_MCP_HYBRID_NORMALIZATION` | no | `min-max` | Score normalization for `normalized-mean`: `min-max` \| `l2` (used only when fusion is `normalized-mean`). |
+| `RAG_MCP_HYBRID_KEYWORD_WEIGHT` | no | `0.5` | Weight of the keyword (BM25) list for `normalized-mean`. If set alone, the vector weight defaults to `1 - keyword`. |
+| `RAG_MCP_HYBRID_VECTOR_WEIGHT` | no | `0.5` | Weight of the vector (kNN) list for `normalized-mean`. If set alone, the keyword weight defaults to `1 - vector`. An explicit pair must sum to `1` or startup fails. |
 | `RAG_MCP_OLLAMA_URL` | no | — | Remote Ollama base URL. **Takes priority over** `RAG_MCP_EMBEDDING_MODEL_DIR`. |
 | `RAG_MCP_OLLAMA_MODEL` | no | `bge-m3` | Model sent to Ollama `/api/embed`. Must output `embedding_length = 1024`. |
 | `RAG_MCP_EMBEDDING_MODEL_DIR` | no | — | Directory with the local BGE-M3 ONNX graph + `tokenizer.json`. |
@@ -227,7 +232,8 @@ Mode dispatch → one request shape on the retrieval backend. `query`, `mode`,
 
 Mode mapping: `keyword` → a single BM25-only request; `semantic` → embed the
 query, then a kNN-only request; `hybrid` (default) → embed the query, then
-independent BM25 and kNN requests fused client-side with RRF. Use `keyword`
+independent BM25 and kNN requests fused per `RAG_MCP_HYBRID_FUSION` (client
+RRF, a normalized weighted mean, or server-side RRF — see below). Use `keyword`
 for exact terms (error codes, function names); `semantic` for vague,
 intent-based queries; `hybrid` for the balanced default.
 
@@ -268,7 +274,9 @@ Results (from `search` / `keyword_search` / `vector_search`) are arrays of:
   `tsvector`.
 - `matched_ann` is `true` when the hit appeared in the kNN result list — i.e.
   the request carried a kNN clause (semantic mode, or a hit found by the kNN
-  leg of a hybrid search).
+  leg of a client-side-fused hybrid search). Under `server-rrf` (ES's native
+  fused RRF), the engine doesn't expose per-hit clause provenance, so
+  `matched_ann` is request-level: `true` for every hybrid hit.
 
 `fetch_by_id` returns:
 
@@ -296,25 +304,43 @@ merge, no calibration.
 - `keyword`: `keyword = Some(query), query_vector = None` → BM25-only request.
 - `semantic`: `keyword = None, query_vector = Some(embedding)` → kNN-only
   request (exactly one embed call).
-- `hybrid`: `keyword = Some(query), query_vector = Some(embedding)` → two
-  independent requests (BM25-only and kNN-only) fused client-side with RRF.
+- `hybrid`: `keyword = Some(query), query_vector = Some(embedding)` → keyword
+  and kNN results combined per the configured fusion strategy (below).
 
 ### Fusion (hybrid mode)
 
-Reciprocal rank fusion, implemented in `es_prefilter.rs::rrf_fuse`:
+Which method hybrid mode uses to combine the keyword and kNN lists is selected
+at startup via `RAG_MCP_HYBRID_FUSION` and threaded from `config.rs` through
+`wiring.rs` into `EsRetrievalBackend`. The three strategies are not drop-in
+equivalents — pick by what you trust in your corpus:
 
-- each hit contributes `1 / (rank_constant + rank + 1)` per list it appears in;
-- each list contributes at most `window_size` hits;
-- a hit present in the kNN list is an ANN match (`matched_ann: true`);
-- the keyword clause's `<em>` highlight wins; ANN-only hits fall back to a
-  truncated content snippet;
-- ties break by id (score desc, id asc) for deterministic ordering.
+| Strategy | Request shape | Fusion | License | When to choose |
+| --- | --- | --- | --- | --- |
+| `client-rrf` (default) | two ES requests | client-side RRF (`es_prefilter::rrf_fuse`) | free | Robust default; ignores score magnitude, immune to BM25-vs-cosine scale mismatch. |
+| `normalized-mean` | two ES requests | `es_prefilter::score_fuse`: min-max or L2-normalize each list, then weighted mean | free | You want score *magnitude* (a much stronger BM25 match outranks a middling one) and per-list weights. Min-max is outlier-sensitive. |
+| `server-rrf` | one ES request (`query` + `knn` + `rank: { rrf }`) | engine-native RRF | Platinum/Enterprise | You have a licensed cluster and want ES to own the fused ranking. |
+
+Shared behavior under every strategy: the keyword clause's `<em>` highlight
+wins the snippet; ANN-only hits fall back to a truncated content snippet;
+`matched_ann` marks hits that came via the kNN leg (per-hit under the
+client-side strategies, request-level under `server-rrf`). The client-side
+fusions break ties deterministically by id (score desc, id asc);
+`server-rrf` keeps Elasticsearch's own ordering.
 
 `RrfConfig { window_size, rank_constant }` defaults to ES's own RRF values
-(100 / 60) and is overridable via `RAG_MCP_RRF_WINDOW_SIZE` /
-`RAG_MCP_RRF_RANK_CONSTANT`. Fusing client-side is deliberate: ES's native
-`rank: { rrf }` API requires a paid license; rank-based fusion also needs no
-score-normalization coefficients.
+(100 / 60), is overridable via `RAG_MCP_RRF_WINDOW_SIZE` /
+`RAG_MCP_RRF_RANK_CONSTANT`, and is shared by the `client-rrf` and `server-rrf`
+strategies (the rank block's `rank_window_size`/`rank_constant`).
+
+`normalized-mean` tuning: `RAG_MCP_HYBRID_NORMALIZATION` picks the
+normalization (`min-max` | `l2`), and `RAG_MCP_HYBRID_KEYWORD_WEIGHT` /
+`RAG_MCP_HYBRID_VECTOR_WEIGHT` set the per-list weights (defaulting to equal
+weights; a single set weight fills the other to sum to 1; an explicit pair
+must sum to 1 or startup fails).
+
+`server-rrf` on a basic-license cluster: ES rejects the request and the backend
+surfaces the engine's error as a clear `RagError::Ann` ("hybrid search
+failed: …") rather than silently degrading to keyword-only results.
 
 ## Backends
 
@@ -351,8 +377,9 @@ Owns all three request shapes. The index mapping (as created by
   plus a one-fragment highlight (`<em>…</em>`, fragment_size 150).
 - **semantic** → kNN on `embedding` (HNSW cosine). Exactly one embed call
   plus this request.
-- **hybrid** → the two above, fused client-side with RRF (see Funnel
-  semantics).
+- **hybrid** → the two above (or, under `server-rrf`, one combined
+  `query` + `knn` + `rank: { rrf }` request), fused per the configured
+  strategy (see Funnel semantics).
 - Elasticsearch is near-real-time: after indexing, a document may take ~1s to
   become searchable — the tests and the seed script poll for visibility.
 - Mapping changes (e.g. adding `embedding`) require deleting the index; the

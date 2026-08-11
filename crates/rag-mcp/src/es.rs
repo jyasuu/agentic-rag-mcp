@@ -96,7 +96,7 @@ pub(crate) fn parse_search_response(body: &str) -> anyhow::Result<Vec<EsSearchHi
             source: h.source.source.unwrap_or_default(),
             content: h.source.content,
             highlight: h.highlight.map_or_else(Vec::new, |f| {
-                f.into_iter().flat_map(|(_, frags)| frags).collect()
+                f.into_values().flatten().collect()
             }),
         })
         .collect())
@@ -411,6 +411,27 @@ impl EsClient {
                 .await
                 .context("failed to read Elasticsearch delete-document error body")?;
             bail!("Elasticsearch delete document at {url} failed: {text}");
+        }
+        Ok(())
+    }
+
+    /// Deletes an entire index. Used by the real-ES test cleanup so uniquely
+    /// named test indexes don't accumulate in a shared cluster.
+    #[allow(dead_code)]
+    pub async fn delete_index(&self, index: &str) -> anyhow::Result<()> {
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), index);
+        let resp = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to reach Elasticsearch at {url}"))?;
+        if !resp.status().is_success() {
+            let text = resp
+                .text()
+                .await
+                .context("failed to read Elasticsearch delete-index error body")?;
+            bail!("Elasticsearch delete index at {url} failed: {text}");
         }
         Ok(())
     }

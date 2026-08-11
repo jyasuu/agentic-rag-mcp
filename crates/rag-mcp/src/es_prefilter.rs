@@ -1,11 +1,23 @@
 //! Elasticsearch `RetrievalBackend` — the single retrieval engine behind the
 //! funnel. Keyword mode issues a BM25-only request, semantic mode a kNN-only
-//! request, and hybrid mode both, fused client-side with reciprocal rank
-//! fusion (`rrf_fuse`) — rank-based, so there are no score-normalization
-//! coefficients to calibrate, and it runs on ES's free license (the server-
-//! side `rank: { rrf }` API needs a paid license). `matched_ann` stays
-//! per-hit accurate: a hit is an ANN match exactly when it appeared in the
-//! kNN list.
+//! request, and hybrid mode both, combined by the startup-selected fusion
+//! strategy (`RAG_MCP_HYBRID_FUSION`, threaded through `HybridFusionConfig`):
+//!
+//!   - `client-rrf` (default) — fused client-side with reciprocal rank fusion
+//!     (`rrf_fuse`): rank-based, so no score-normalization coefficients to
+//!     calibrate, and it runs on ES's free license.
+//!   - `normalized-mean` — fused client-side by `score_fuse`: each list's raw
+//!     scores normalized (min-max or L2) then combined by a weighted mean
+//!     (`FusionWeights`). Score-magnitude-aware, still free license.
+//!   - `server-rrf` — a single combined request fused natively by ES's
+//!     `rank: { rrf }` block. License-gated (Platinum/Enterprise); the
+//!     engine's rejection surfaces as-is rather than being silently worked
+//!     around client-side.
+//!
+//! `matched_ann` stays per-hit accurate under the client-side strategies (a
+//! hit is an ANN match exactly when it appeared in the kNN list); under
+//! `server-rrf` it is request-level, because ES RRF responses don't expose
+//! per-hit clause provenance.
 //!
 //! Errors are classed so callers know the failure mode: keyword-mode failures
 //! surface as `RagError::PreFilter` (the tsvector fallback can catch those),
@@ -683,14 +695,10 @@ mod tests {
     }
 
     async fn cleanup_index(client: &EsClient, index: &str) {
-        let url = format!("{}/{}", client.base_url().trim_end_matches('/'), index);
-        let resp = client
-            .http()
-            .delete(&url)
-            .send()
+        client
+            .delete_index(index)
             .await
-            .expect("index delete should be reachable");
-        assert!(resp.status().is_success(), "index cleanup should succeed");
+            .expect("index cleanup should succeed");
     }
 
     /// A deterministic pseudo-random vector seeded by `seed`, so two fixtures
@@ -736,6 +744,32 @@ mod tests {
             .search(RetrievalMode::Keyword, Some(query), None, 10)
             .await
             .expect("search should succeed")
+    }
+
+    /// Hybrid-mode poll for the client-side fusion tests. `hits.len() == 2`
+    /// alone can be satisfied by two kNN-only hits while the keyword segment
+    /// is still refreshing, which would flake the `<em>` highlight assertions
+    /// these tests make — so also require the keyword clause's highlight to be
+    /// visible before returning.
+    async fn search_hybrid_until_highlighted(
+        backend: &EsRetrievalBackend,
+        query: &str,
+        vector: &[f32],
+    ) -> Vec<RankedHit> {
+        for _ in 0..20 {
+            let hits = backend
+                .search(RetrievalMode::Hybrid, Some(query), Some(vector), 10)
+                .await
+                .expect("hybrid search should succeed");
+            if hits.len() == 2 && hits.iter().any(|h| h.snippet.contains("<em>连接</em>")) {
+                return hits;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        backend
+            .search(RetrievalMode::Hybrid, Some(query), Some(vector), 10)
+            .await
+            .expect("hybrid search should succeed")
     }
 
     #[tokio::test]
@@ -901,17 +935,7 @@ mod tests {
         // hy-2 matches only the kNN clause. Client-side RRF must return both,
         // rank hy-1 first (it appears in both ranked lists), and keep scores
         // positive.
-        let mut hits = Vec::new();
-        for _ in 0..20 {
-            hits = backend
-                .search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10)
-                .await
-                .expect("hybrid search should succeed");
-            if hits.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        let hits = search_hybrid_until_highlighted(&backend, "连接失败", &va).await;
 
         assert_eq!(hits.len(), 2, "both the keyword match and the kNN match should surface");
         assert_eq!(hits[0].id, "hy-1", "doc matched by both clauses ranks first under RRF");
@@ -963,17 +987,7 @@ mod tests {
         };
         let backend = backend_with_fusion(client.clone(), index.clone(), fusion);
 
-        let mut hits = Vec::new();
-        for _ in 0..20 {
-            hits = backend
-                .search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10)
-                .await
-                .expect("hybrid search should succeed");
-            if hits.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
+        let hits = search_hybrid_until_highlighted(&backend, "连接失败", &va).await;
 
         assert_eq!(hits.len(), 2, "both docs should surface under weighted-mean fusion");
         assert_eq!(hits[0].id, "nm-1", "stronger keyword match wins when keyword weight dominates");
@@ -1011,21 +1025,42 @@ mod tests {
         // The license gate is engine-side: a licensed cluster returns fused
         // results; a basic-license cluster rejects the request, and that must
         // surface as a clear `Ann` error naming the failure rather than
-        // silently degrading to empty results.
-        match backend.search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10).await {
-            Ok(hits) => {
-                assert!(
-                    hits.iter().any(|h| h.id == "sr-1"),
-                    "server-side RRF should surface the matching doc, got {hits:?}"
-                );
+        // silently degrading to empty results. Poll like the other hybrid
+        // tests (ES is near-real-time), treating an engine rejection as the
+        // license outcome and a stable empty response as a timeout.
+        let mut license_error: Option<String> = None;
+        let mut hits = Vec::new();
+        for _ in 0..20 {
+            match backend.search(RetrievalMode::Hybrid, Some("连接失败"), Some(&va), 10).await {
+                Ok(h) => {
+                    if h.iter().any(|hit| hit.id == "sr-1") {
+                        hits = h;
+                        break;
+                    }
+                    hits = h;
+                }
+                Err(RagError::Ann(msg)) => {
+                    if msg.contains("hybrid search failed") {
+                        license_error = Some(msg);
+                        break;
+                    }
+                    panic!("unexpected Ann error from server-rrf: {msg:?}");
+                }
+                Err(other) => panic!("server-rrf must surface Ok or RagError::Ann, got {other:?}"),
             }
-            Err(RagError::Ann(msg)) => {
-                assert!(
-                    msg.contains("hybrid search failed"),
-                    "license rejection must surface as a clear Ann error, got {msg:?}"
-                );
-            }
-            Err(other) => panic!("server-rrf must surface Ok or RagError::Ann, got {other:?}"),
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        if let Some(msg) = license_error {
+            assert!(
+                msg.contains("hybrid search failed"),
+                "license rejection must surface as a clear Ann error, got {msg:?}"
+            );
+        } else {
+            assert!(
+                hits.iter().any(|h| h.id == "sr-1"),
+                "server-side RRF should surface the matching doc, got {hits:?}"
+            );
         }
 
         cleanup_index(&client, &index).await;

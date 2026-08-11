@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 
 /// How the caller wants `search` to run the funnel.
 ///
-/// `Hybrid` is the default: Elasticsearch fuses the keyword (BM25) and
-/// semantic (kNN) clauses natively with reciprocal rank fusion (RRF), so
-/// relevance is decided by one engine's ranking rather than a hand-rolled
-/// score merge. `Keyword` and `Semantic` let an agent bypass the fuse when it
-/// already knows the query shape. Maps 1:1 onto `RetrievalMode`, which the
-/// funnel hands to the retrieval backend.
+/// `Hybrid` is the default: the retrieval backend combines the keyword (BM25)
+/// and semantic (kNN) clauses per the configured fusion strategy (client-side
+/// RRF, a normalized weighted mean, or server-side RRF), so relevance is
+/// decided by one engine's ranking rather than a hand-rolled score merge.
+/// `Keyword` and `Semantic` let an agent bypass the fuse when it already knows
+/// the query shape. Maps 1:1 onto `RetrievalMode`, which the funnel hands to
+/// the retrieval backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
@@ -48,24 +49,29 @@ pub struct SearchFilters {
 }
 
 /// A single hit returned by a `RetrievalBackend`, unifying keyword (BM25),
-/// semantic (kNN), and hybrid (RRF) results so the funnel can produce
-/// `ScoredResult`s directly. Replaces the `PreFilterHit` / `AnnHit` split.
+/// semantic (kNN), and hybrid (fused BM25 + kNN) results so the funnel can
+/// produce `ScoredResult`s directly. Replaces the `PreFilterHit` / `AnnHit`
+/// split.
 #[derive(Debug, Clone)]
 pub struct RankedHit {
     pub id: String,
     pub source: String,
     /// Engine-native score: BM25 for keyword, cosine similarity for semantic,
-    /// and the RRF score for hybrid. Ranges are engine-specific and NOT
-    /// normalized — Elasticsearch owns the ranking.
+    /// and the RRF / weighted-mean fused score for hybrid. Ranges are
+    /// engine-specific and NOT normalized — Elasticsearch owns the ranking.
     pub score: f32,
     /// Rendered snippet: `<em>`-highlighted for BM25 matches, truncated for
     /// ANN-only hits (there is no query clause to highlight).
     pub snippet: String,
     /// Which strategy produced the hit. Request-level: for an ES hybrid
-    /// request every hit reports Elasticsearch, since RRF responses don't
-    /// expose which clause matched.
+    /// request every hit reports Elasticsearch (engine RRF responses don't
+    /// expose which clause matched, and the client-side fusions merge into
+    /// one list), so provenance beyond "ES" lives in `matched_ann`.
     pub which_strategy: PreFilterStrategyKind,
-    /// Whether the request carried a kNN clause (request-level, not per-hit).
+    /// Whether this hit came via the kNN clause. Per-hit accurate under the
+    /// client-side fusion strategies (a keyword-only hit is `false`); under
+    /// `server-rrf` it is request-level — ES's engine RRF doesn't expose
+    /// per-clause provenance, so every hit reports `true`.
     pub matched_ann: bool,
 }
 

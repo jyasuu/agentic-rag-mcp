@@ -89,8 +89,8 @@ support articles, English API docs, and error codes) and:
 3. Mirrors each document into the Elasticsearch `documents` index with the
    `ik_max_word` analyzer mapping and the `embedding` `dense_vector(1024)`
    field, storing each embedding in its document. Elasticsearch is the sole
-   retrieval engine (BM25 / kNN / hybrid RRF), so the vector lives there — not
-   in Postgres.
+   retrieval engine (BM25 / kNN / hybrid RRF or weighted-mean), so the vector
+   lives there — not in Postgres.
 
 Rerun it any time; inserts are `ON CONFLICT ... DO UPDATE`. `--delete` removes
 exactly the fixture rows:
@@ -122,6 +122,12 @@ This sets the example defaults (database URL, ES URL, bind addr, embedder
 preference) and runs `cargo run -p rag-mcp`. The server health-checks Postgres
 **and** Elasticsearch at startup and exits with a clear error if either is
 unreachable.
+
+Hybrid mode merges the keyword and kNN lists per `RAG_MCP_HYBRID_FUSION`
+(`client-rrf` default | `normalized-mean` | `server-rrf`); `normalized-mean`
+has its own tuning (`RAG_MCP_HYBRID_NORMALIZATION`,
+`RAG_MCP_HYBRID_KEYWORD_WEIGHT`, `RAG_MCP_HYBRID_VECTOR_WEIGHT`). Full env-var
+reference: [`reference.md`](reference.md).
 
 The MCP endpoint is `POST http://127.0.0.1:8080/mcp`, protected by
 `Authorization: Bearer <token>`.

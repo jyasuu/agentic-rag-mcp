@@ -101,15 +101,20 @@ duplicate-detection system.
      - Elasticsearch + `ik_analyzer` — primary strategy for Chinese content.
      - Postgres `tsvector` — for English/code content (identifiers, error codes).
      - `pg_trgm` — fallback when ES is unavailable/unsynced.
-  2. **ANN (conditional)** — pgvector cosine/L2 search. Only runs when: (a) agent
-     explicitly requests `mode: "semantic"` or `"hybrid"`, or (b) auto
-     short-circuit logic determines the pre-filter stage didn't return enough
-     high-confidence hits. Query embedding produced locally via BGE-M3 (`ort`
-     runtime).
-  3. **Scoring** — fixed-coefficient weighted combination of exact-match score,
-     ANN similarity, and metadata signals (freshness, source weight), matching
-     the dedup system's `ScoringConfig`-style approach. Coefficients live in a
-     single config struct, not scattered through funnel logic.
+   2. **ANN (conditional)** — pgvector cosine/L2 search. Only runs when: (a) agent
+      explicitly requests `mode: "semantic"` or `"hybrid"`, or (b) auto
+      short-circuit logic determines the pre-filter stage didn't return enough
+      high-confidence hits. Query embedding produced locally via BGE-M3 (`ort`
+      runtime).
+   3. **Scoring** — fixed-coefficient weighted combination of exact-match score,
+      ANN similarity, and metadata signals (freshness, source weight), matching
+      the dedup system's `ScoringConfig`-style approach. Coefficients live in a
+      single config struct, not scattered through funnel logic.
+   4. **Hybrid fusion (configurable)** — when hybrid mode runs, the keyword and
+      ANN lists are merged into one ranked result set via a strategy selected by
+      `RAG_MCP_HYBRID_FUSION`: `client-rrf` (default), `normalized-mean`, or
+      `server-rrf` (ES engine-native RRF, requires a Platinum/Enterprise
+      license). See `examples/reference.md` for the trade-offs.
 - **Sync**: Postgres → Elasticsearch via CDC, reusing `pg_x`-style logical
   replication patterns. A consumer service applies Postgres changes (insert/
   update/delete) to the ES index.
